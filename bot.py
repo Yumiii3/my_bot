@@ -742,6 +742,7 @@ def cmd_info(message):
         "🔹 <b>/admin</b> — открыть админ-панель\n"
         "🔹 <b>/info</b> — показать эту шпаргалку\n\n"
         "🔹 <b>/edit_faq</b> — позволяет поменять часто задаваемые вопросы в «Вопросы и связь»\n\n"
+		"🔹 <b>//my_q</b> — посмотреть все новые вопросы»\n\n"
         "📍 <i>Все команды работают только для мастера.</i>"
     )
     safe_send(message.chat.id, text, main_menu(message.from_user.id))
@@ -1571,6 +1572,7 @@ def handle_admin_callback(call, data: str) -> None:
             "⚙️ /admin — открыть админ-панель\n"
             "🆔 /myid — узнать свой Telegram ID\n\n"
             "❓/edit_faq — изменить текст «Вопросы и связь»\n\n"
+			"💬/my_q — посмотреть все новые вопросы»\n\n"
             "📍 <i>Нажми на любую команду, чтобы выполнить её.</i>"
 		)
         safe_edit(call, text, admin_menu_kb())
