@@ -989,7 +989,7 @@ def cmd_del_photo(message):
     chunks = [rows[i:i + chunk_size] for i in range(0, len(rows), chunk_size)]
 
     send_del_portfolio_chunk(message.chat.id, chunks[0], 0, len(chunks))
-
+	
 def send_del_portfolio_chunk(chat_id, chunk, chunk_index, total_chunks):
     # Группируем фото в альбом
     media_group = []
