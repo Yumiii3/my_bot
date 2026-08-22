@@ -980,16 +980,14 @@ def cmd_del_photo(message):
         safe_send(message.chat.id, "🌷 Фото удалено.")
         return
 
-        rows = q_all("SELECT id, file_id, caption FROM portfolio")
+    rows = q_all("SELECT id, file_id, caption FROM portfolio WHERE master_id=?", (message.from_user.id,))
     if not rows:
         safe_send(message.chat.id, "📭 В портфолио пока нет фото для удаления.", main_menu(message.from_user.id))
         return
 
-    # Разбиваем на группы по 9 штук
     chunk_size = 9
     chunks = [rows[i:i + chunk_size] for i in range(0, len(rows), chunk_size)]
 
-    # Отправляем первую группу с кнопками удаления
     send_del_portfolio_chunk(message.chat.id, chunks[0], 0, len(chunks))
 
 def send_del_portfolio_chunk(chat_id, chunk, chunk_index, total_chunks):
