@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 
 import telebot
 from telebot import types
+last_portfolio_msg = {}  # Здесь будем хранить ID сообщений портфолио для каждого чата
 
 # ==========================================================
 #                    0.ЗАГРУЗКА НАСТРОЕК
@@ -937,34 +938,27 @@ def cmd_broadcast(message):
 
 @bot.message_handler(func=lambda m: m.text == "📁 Портфолио")
 def show_portfolio(message):
-    # Загружаем все фото из базы
-    rows = q_all("SELECT file_id, caption FROM portfolio")
+    chat_id = message.chat.id
     
+    # Удаляем старые сообщения портфолио, если они есть
+    if chat_id in last_portfolio_msg:
+        for msg_id in last_portfolio_msg[chat_id]:
+            try:
+                bot.delete_message(chat_id, msg_id)
+            except Exception:
+                pass
+    
+    rows = q_all("SELECT file_id, caption FROM portfolio")
     if not rows:
         safe_send(message.chat.id, "📭 У мастера пока нет фото в портфолио.", main_menu(message.from_user.id))
         return
     
-    # Разбиваем по 10 штук
     chunk_size = 9
     chunks = [rows[i:i + chunk_size] for i in range(0, len(rows), chunk_size)]
     
-    # Отправляем первую группу
-    send_portfolio_chunk(message.chat.id, chunks[0], 0, len(chunks))
-
-def send_portfolio_chunk(chat_id, chunk, chunk_index, total_chunks):
-    # Группируем фото в альбом (InputMediaPhoto)
-    media_group = []
-    for row in chunk:
-        media_group.append(types.InputMediaPhoto(media=row["file_id"]))
-    
-    # Отправляем альбом (одно сообщение с несколькими фото)
-    bot.send_media_group(chat_id, media_group)
-    
-    # Если есть ещё группы, добавляем кнопку "Дальше"
-    if chunk_index + 1 < total_chunks:
-        kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("➡️ Дальше", callback_data=f"port:{chunk_index + 1}"))
-        safe_send(chat_id, "📁 Ещё фото:", reply_markup=kb)
+    # Отправляем первую группу и получаем ID отправленных сообщений
+    msg_ids = send_portfolio_chunk(message.chat.id, chunks[0], 0, len(chunks))
+    last_portfolio_msg[chat_id] = msg_ids
 
 @bot.message_handler(commands=["add_photo"])
 def cmd_add_photo(message):
@@ -1129,7 +1123,7 @@ END:VCALENDAR"""
             bot.answer_callback_query(call.id, "📂 Загружаю следующую партию...")
 
                 # ---------- клиент: листать портфолио ----------
-        elif data.startswith("port:"):
+         elif data.startswith("port:"):
             chunk_index = int(data.split(":")[1])
             rows = q_all("SELECT file_id, caption FROM portfolio")
             chunk_size = 9
