@@ -1123,7 +1123,7 @@ END:VCALENDAR"""
             bot.answer_callback_query(call.id, "📂 Загружаю следующую партию...")
 
                 # ---------- клиент: листать портфолио ----------
-                 elif data.startswith("port:"):
+         elif data.startswith("port:"):
             chunk_index = int(data.split(":")[1])
             rows = q_all("SELECT file_id, caption FROM portfolio")
             chunk_size = 9
@@ -1135,7 +1135,7 @@ END:VCALENDAR"""
                 
             send_portfolio_chunk(call.message.chat.id, chunks[chunk_index], chunk_index, len(chunks))
             bot.answer_callback_query(call.id, "📁 Загружаю следующее...")
-
+		
         # ---------- мастер: ответить на вопрос клиента ----------
         elif data.startswith("ans_q:"):
             q_id = int(data.split(":")[1])
