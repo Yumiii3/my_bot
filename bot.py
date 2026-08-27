@@ -1122,19 +1122,6 @@ END:VCALENDAR"""
             send_del_portfolio_chunk(call.message.chat.id, chunks[chunk_index], chunk_index, len(chunks))
             bot.answer_callback_query(call.id, "📂 Загружаю следующую партию...")
 
-                # ---------- клиент: листать портфолио ----------
-elif data.startswith("port:"):
-            chunk_index = int(data.split(":")[1])
-            rows = q_all("SELECT file_id, caption FROM portfolio")
-            chunk_size = 9
-            chunks = [rows[i:i + chunk_size] for i in range(0, len(rows), chunk_size)]
-            
-            # Защита: если страницы не существует, переходим на последнюю
-            if chunk_index >= len(chunks):
-                chunk_index = len(chunks) - 1
-                
-            send_portfolio_chunk(call.message.chat.id, chunks[chunk_index], chunk_index, len(chunks))
-            bot.answer_callback_query(call.id, "📁 Загружаю следующее...")
         # ---------- мастер: ответить на вопрос клиента ----------
         elif data.startswith("ans_q:"):
             q_id = int(data.split(":")[1])
@@ -1178,9 +1165,24 @@ elif data.startswith("port:"):
             if not is_admin(user_id):
                 safe_edit(call, "⛔️ Доступно только мастеру.")
                 return
-            handle_admin_callback(call, data)
+            handle_admin_callback(call, data)         
+        # ---------- клиент: листать портфолио ----------   
+        elif data.startswith("port:"):
+            chunk_index = int(data.split(":")[1])
+            rows = q_all("SELECT file_id, caption FROM portfolio")
+            chunk_size = 9
+            chunks = [rows[i:i + chunk_size] for i in range(0, len(rows), chunk_size)]
+            
+            # Защита: если страницы не существует, переходим на последнюю
+            if chunk_index >= len(chunks):
+                chunk_index = len(chunks) - 1
+                
+            send_portfolio_chunk(call.message.chat.id, chunks[chunk_index], chunk_index, len(chunks))
+            bot.answer_callback_query(call.id, "📁 Загружаю следующее...")
         else:
             safe_edit(call, "🤔 Не понял кнопку. Открой меню командой /start")
+
+
     except Exception as exc:  # noqa: BLE001
         logger.exception("Ошибка в callback '%s': %s", data, exc)
         safe_send(user_id, "⚠️ Что-то пошло не так. Попробуй ещё раз или напиши /start")
