@@ -1,4 +1,4 @@
-""
+"""
 Telegram-бот записи клиентов к частному мастеру (парикмахер / массажист / репетитор).
 Стек: Python 3.11+, pyTelegramBotAPI (telebot), SQLite.
 Запуск: TOKEN="8756700491:AAE6gA2oCcRMJE0d8hQnxIS20aLcDK1_Myk" ADMIN_ID="8636659463" python main.py   (или через файл .env рядом с main.py)
