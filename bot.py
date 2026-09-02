@@ -646,7 +646,7 @@ def cmd_start(message):
     clear_state(message.from_user.id)
     text = (
         f"🌸 Привет, {esc(message.from_user.first_name)}!\n\n"
-        f"Я помощник мастера <b>{esc(MASTER_NAME)}</b> ✂️\n"
+        f"Я помощник мастера <b>{esc(MASTER_NAME)}</b> 💅 \n"
         "Помогу записаться на стрижку за 30 секунд — без звонков и переписок.\n\n"
         "✧ <b>Что я умею:</b>\n"
         f" {BTN_BOOK} — выбрать услугу и свободное окошко\n"
@@ -1380,7 +1380,7 @@ def handle_admin_callback(call, data: str) -> None:
 
     elif data == "adm:add_service":
         set_state(user_id, "svc_name")
-        safe_edit(call, "🧾 <b>Новая услуга</b>\n\nШаг 1/3. Введи название (например: «Стрижка мужская»):\n"
+        safe_edit(call, "🧾 <b>Новая услуга</b>\n\nШаг 1/3. Введи название (например: «Маникюр(без покрытия)»):\n"
                         "Отмена — /cancel")
 
     elif data == "adm:add_slot":
