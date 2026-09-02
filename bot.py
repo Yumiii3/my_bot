@@ -935,30 +935,21 @@ def cmd_broadcast(message):
         f"📨 Отправлено: {success}\n"
         f"❌ Не доставлено (пользователь удалил бота): {fail}"
     )
-
+	
 @bot.message_handler(func=lambda m: m.text == "📁 Портфолио")
 def show_portfolio(message):
     chat_id = message.chat.id
     
-    # Удаляем старые сообщения портфолио, если они есть
-    if chat_id in last_portfolio_msg:
-        for msg_id in last_portfolio_msg[chat_id]:
-            try:
-                bot.delete_message(chat_id, msg_id)
-            except Exception:
-                pass
-    
+    # Получаем все фото из базы
     rows = q_all("SELECT file_id, caption FROM portfolio")
     if not rows:
         safe_send(message.chat.id, "📭 У мастера пока нет фото в портфолио.", main_menu(message.from_user.id))
         return
     
-    chunk_size = 9
-    chunks = [rows[i:i + chunk_size] for i in range(0, len(rows), chunk_size)]
-    
-    # Отправляем первую группу и получаем ID отправленных сообщений
-    msg_ids = send_portfolio_chunk(message.chat.id, chunks[0], 0, len(chunks))
-    last_portfolio_msg[chat_id] = msg_ids
+    # Отправляем фото красивым альбомом (до 10 штук за раз)
+    media_group = [types.InputMediaPhoto(media=row["file_id"]) for row in rows[:10]]
+    bot.send_media_group(chat_id, media_group)
+    safe_send(message.chat.id, "📁 Вот работы мастера ✨", main_menu(message.from_user.id))
 
 @bot.message_handler(commands=["add_photo"])
 def cmd_add_photo(message):
