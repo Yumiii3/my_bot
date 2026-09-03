@@ -974,6 +974,17 @@ def cmd_del_photo(message):
     chunks = [rows[i:i + chunk_size] for i in range(0, len(rows), chunk_size)]
 
     send_del_portfolio_chunk(message.chat.id, chunks[0], 0, len(chunks))
+
+def send_portfolio_chunk(chat_id, chunk, chunk_index, total_chunks):
+    """Отправляет портфолио альбомом, с кнопкой 'Дальше'."""
+    media_group = [types.InputMediaPhoto(media=row["file_id"]) for row in chunk]
+    bot.send_media_group(chat_id, media_group)
+    
+    # Если есть ещё фото — добавляем кнопку "Дальше"
+    if chunk_index + 1 < total_chunks:
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("➡️ Дальше", callback_data=f"port:{chunk_index + 1}"))
+        safe_send(chat_id, "📁 Ещё фото:", reply_markup=kb)
 	
 def send_del_portfolio_chunk(chat_id, chunk, chunk_index, total_chunks):
     # Группируем фото в альбом
@@ -1606,7 +1617,7 @@ def on_text(message):
             if not slot or slot["is_booked"]:
                 safe_send(message.chat.id, "😔 Это время уже заняли. Выбери другое 👇", main_menu(user_id))
                 return
-            set_state(user_id, "await_comment", slot_id=slot_id)
+            set_state(user_id, "await_comment", slot_id=data["slot_id"])
             kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
             kb.add("➡️ Далее")
             safe_send(message.chat.id, 
@@ -1911,44 +1922,6 @@ def main() -> None:
             logger.exception("Polling прервался: %s. Перезапуск через 10 сек...", exc)
             time.sleep(10)
 # Функция генерации слотов (расписания)
-def generate_slots(service_id: int, start_time: str, end_time: str,
-                   step_min: int, days_ahead: int, only_weekdays: bool):
-    """Создаёт слоты для указанной услуги на N дней вперёд."""
-    today = now_local().date()
-    added = 0
-    skipped = 0
-    days_used = 0
-    capped = False
-
-    for day_offset in range(days_ahead):
-        current_date = today + timedelta(days=day_offset)
-        # Если нужны только будни (пн-пт), пропускаем сб/вс
-        if only_weekdays and current_date.weekday() >= 5:
-            continue
-
-        date_iso = current_date.isoformat()
-        # Генерируем время от start до end с шагом step_min
-        cur_time = datetime.strptime(start_time, "%H:%M")
-        end_dt = datetime.strptime(end_time, "%H:%M")
-
-        while cur_time < end_dt:
-            time_str = cur_time.strftime("%H:%M")
-            exists = q_one("SELECT id FROM slots WHERE service_id=? AND date=? AND time=?",
-                           (service_id, date_iso, time_str))
-            if exists:
-                skipped += 1
-            else:
-                if added >= MAX_GEN_SLOTS:
-                    capped = True
-                    return added, skipped, days_used, capped
-                q_exec("INSERT INTO slots (service_id, date, time, is_booked) VALUES (?,?,?, 0)",
-                       (service_id, date_iso, time_str))
-                added += 1
-
-            cur_time += timedelta(minutes=step_min)
-        days_used += 1
-
-    return added, skipped, days_used, capped
 
 
 if __name__ == "__main__":
