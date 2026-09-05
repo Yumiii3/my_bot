@@ -1917,6 +1917,7 @@ def main() -> None:
 
     while True:
         try:
+			bot.delete_webhook()
             bot.infinity_polling(none_stop=True, timeout=30, long_polling_timeout=30, skip_pending=True)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Polling прервался: %s. Перезапуск через 10 сек...", exc)
