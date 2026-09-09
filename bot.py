@@ -13,6 +13,7 @@ import logging
 import threading
 import schedule
 import pytz
+import sys
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -53,6 +54,59 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("booking-bot")
+
+# ==========================================================
+#              ЗАЩИТА ОТ ЗАПУСКА ВТОРОЙ КОПИИ
+# ==========================================================
+
+LOCK_FILE = "bot.lock"
+
+
+def acquire_single_instance():
+    """
+    Разрешает работать только одной копии бота.
+    Если другая копия уже запущена — текущая завершается.
+    """
+    try:
+        # 'x' создаёт файл только если его ещё нет.
+        # Если файл существует — получим FileExistsError.
+        lock = open(LOCK_FILE, "x", encoding="utf-8")
+        lock.write(str(os.getpid()))
+        lock.close()
+
+        logger.info("Экземпляр бота заблокирован. PID=%s", os.getpid())
+
+    except FileExistsError:
+        # Проверяем PID старого процесса
+        try:
+            with open(LOCK_FILE, "r", encoding="utf-8") as f:
+                old_pid = f.read().strip()
+        except Exception:
+            old_pid = "неизвестен"
+
+        logger.error(
+            "❌ Бот уже запущен!\n"
+            "PID предыдущего процесса: %s\n"
+            "Вторая копия запускаться не будет.",
+            old_pid
+        )
+
+        raise SystemExit(1)
+
+    except Exception as exc:
+        logger.exception("Не удалось создать lock-файл: %s", exc)
+        raise SystemExit(1)
+
+
+def release_single_instance():
+    """Удаляет lock-файл при завершении программы."""
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+            logger.info("Lock-файл удалён.")
+    except Exception as exc:
+        logger.warning("Не удалось удалить lock-файл: %s", exc)
+
 
 
 def env_int(name: str, default: int = 0) -> int:
@@ -1906,23 +1960,42 @@ def start_web_server() -> None:
 # ==========================================================
 
 def main() -> None:
-    init_db()
-    start_web_server()
+    acquire_single_instance()
 
     try:
-        me = bot.get_me()
-        logger.info("Бот @%s запущен. ADMIN_ID=%s, TZ=UTC+%s", me.username, ADMIN_ID, TZ_OFFSET)
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Не удалось проверить токен (get_me): %s", exc)
+        init_db()
+        start_web_server()
 
-    while True:
         try:
-            bot.delete_webhook()
-            bot.infinity_polling(none_stop=True, timeout=30, long_polling_timeout=30, skip_pending=True)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Polling прервался: %s. Перезапуск через 10 сек...", exc)
-            time.sleep(10)
-# Функция генерации слотов (расписания)
+            me = bot.get_me()
+            logger.info(
+                "Бот @%s запущен. ADMIN_ID=%s, TZ=UTC+%s",
+                me.username,
+                ADMIN_ID,
+                TZ_OFFSET
+            )
+        except Exception as exc:
+            logger.error("Не удалось проверить токен (get_me): %s", exc)
+
+        while True:
+            try:
+                bot.delete_webhook()
+                bot.infinity_polling(
+                    none_stop=True,
+                    timeout=30,
+                    long_polling_timeout=30,
+                    skip_pending=True
+                )
+
+            except Exception as exc:
+                logger.exception(
+                    "Polling прервался: %s. Перезапуск через 10 сек...",
+                    exc
+                )
+                time.sleep(10)
+
+    finally:
+        release_single_instance()
 
 
 if __name__ == "__main__":
