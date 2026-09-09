@@ -121,7 +121,7 @@ def env_int(name: str, default: int = 0) -> int:
         return default
 
 
-TOKEN = ("8756700491:AAE6gA2oCcRMJE0d8hQnxIS20aLcDK1_Myk")
+TOKEN = ("8756700491:AAFWUvMYqH1YPc8h8B89m47RI3-3y04esp0")
 if not TOKEN:
     raise SystemExit(
         "\n❌ ОШИБКА ЗАПУСКА: не задана переменная окружения TOKEN.\n"
