@@ -601,15 +601,20 @@ def init_db() -> None:
             "TEXT",
         )
 
+        default_faq = (
+            "💬 <b>Вопросы и связь</b>\n\n"
+            "Если у вас есть вопрос, напишите его прямо в этот чат. "
+            "Мастер ответит, как только освободится."
+        )
+
         connection.execute("""
             INSERT OR IGNORE INTO config(key, value)
-            VALUES(
-                'faq_text',
-                '💬 <b>Вопросы и связь</b>\n\n'
-                'Если у вас есть вопрос, напишите его прямо в этот чат. '
-                'Мастер ответит, как только освободится.'
-            )
-        """)
+            VALUES(?, ?)
+        """, (
+            "faq_text",
+             default_faq,
+        ))
+
 
         connection.execute("""
             CREATE INDEX IF NOT EXISTS idx_slots_lookup
