@@ -1,0 +1,7 @@
+.env
+bookings.db
+*.db
+backups/
+bot.lock
+__pycache__/
+*.pyc
