@@ -3856,7 +3856,7 @@ def main():
 
         while True:
             try:
-                bot.delete_webhook()
+                bot.delete_webhook(drop_pending_updates=True)
 
                 bot.infinity_polling(
                     timeout=30,
