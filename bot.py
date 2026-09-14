@@ -182,7 +182,7 @@ def init_db() -> None:
                 """)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS portfolio (
-                        id INTEGER SERIAL PRIMARY KEY,
+                        id SERIAL PRIMARY KEY,
                         master_id INTEGER NOT NULL,
                         file_id TEXT NOT NULL,
                         caption TEXT
