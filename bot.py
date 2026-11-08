@@ -2,7 +2,7 @@
 Telegram-бот записи клиентов к частному мастеру (парикмахер / массажист / репетитор).
 Стек: Python 3.11+, pyTelegramBotAPI (telebot), PostgreSQL (Neon.tech).
 Запуск: 
-TOKEN="8756700491:AAHaIYXIniATgK429HRHsAHqulb7ddAeeYE" ADMIN_ID="8636659463" python main.py   (или через файл .env рядом с main.py)
+TOKEN="ТВОЙ_ТОКЕН_ОТ_BOTFATHER" ADMIN_ID="ТВОЙ_TELEGRAM_ID" python main.py   (или через файл .env рядом с main.py)
 """
 
 import os
@@ -571,7 +571,35 @@ def book_slot(slot_id: int, user_id: int, client_name: str) -> bool:
                     SET is_booked = 1, client_id = %s, client_name = %s
                     WHERE id = %s AND is_booked = 0
                 """, (user_id, client_name[:100], slot_id))
-                return cur.rowcount == 1
+                if cur.rowcount == 1:
+                    return True
+                # Слот уже занят. Выясняем, кем.
+                cur.execute("SELECT is_booked, client_id FROM slots WHERE id = %s", (slot_id,))
+                row = cur.fetchone()
+                if row:
+                    is_booked, owner_id = row[0], row[1]
+                    if is_booked and owner_id == user_id:
+                        # Дубль клика / повторная доставка того же confirm —
+                        # слот уже принадлежит этому клиенту, ошибка не нужна.
+                        logger.info("Бронь %s: слот уже принадлежит %s (дубль), считаю успешной",
+                                    slot_id, user_id)
+                        return True
+                    if is_booked and owner_id is None:
+                        # «Мусорная» бронь: слот занят, но клиента нет
+                        # (сбой прошлых запусков). Освобождаем и записываем нового клиента.
+                        logger.warning("Бронь %s: слот был занят без клиента, освобождаю "
+                                       "и записываю %s", slot_id, user_id)
+                        cur.execute("""
+                            UPDATE slots
+                            SET is_booked = 1, client_id = %s, client_name = %s
+                            WHERE id = %s
+                        """, (user_id, client_name[:100], slot_id))
+                        return cur.rowcount == 1
+                    logger.warning("Бронь %s: слот занят пользователем %s (конфликт)",
+                                   slot_id, owner_id)
+                else:
+                    logger.warning("Бронь %s: слот не найден", slot_id)
+                return False
     except Exception as exc:
         logger.exception("Ошибка бронирования слота %s: %s", slot_id, exc)
         return False
@@ -1169,40 +1197,55 @@ def start_confirm(call, slot_id: int) -> None:
     safe_edit(call, confirm_text(slot, name), confirm_kb(slot_id))
 
 
+_confirm_locks = {}
+
+
 def do_book(call, slot_id: int) -> None:
     user_id = call.from_user.id
-    clear_state(user_id)
-    name = get_client_name(user_id) or (call.from_user.first_name or "Клиент")
-    slot = get_slot(slot_id)
-    if not slot:
-        safe_edit(call, "😔 Слот не найден. Попробуй записаться заново.")
+    key = (user_id, slot_id)
+    lock = _confirm_locks.setdefault(key, threading.Lock())
+    if not lock.acquire(blocking=False):
+        # Параллельный дубль того же подтверждения — молча игнорируем.
+        logger.info("Пропущен дубль confirm: user=%s slot=%s", user_id, slot_id)
         return
-    if not book_slot(slot_id, user_id, name):
-        safe_edit(call, "😔 Увы, это время только что забронировали. Выбери другое: " + BTN_BOOK)
-        return
+    try:
+        clear_state(user_id)
+        name = get_client_name(user_id) or (call.from_user.first_name or "Клиент")
+        slot = get_slot(slot_id)
+        if not slot:
+            safe_edit(call, "😔 Слот не найден. Попробуй записаться заново.")
+            return
+        if not book_slot(slot_id, user_id, name):
+            safe_edit(call, "😔 Это время занял другой клиент. Выбери другое: " + BTN_BOOK)
+            return
 
-    safe_edit(call, "✅ <b>Готово! Ты записан(а) к</b> "
-                    f"{esc(MASTER_NAME)}.\n\n"
-                    f"💅 {esc(slot['service_name'] or 'услуга')}\n"
-                    f"🗓 {fmt_date(slot['date'])} в {esc(slot['time'])}\n"
-                    f"💰 {slot['price'] or 0}₽\n\n"
-                    "Если планы изменятся — нажми «❌ Отменить запись».")
-    safe_send(call.message.chat.id, "Ждём тебя! 💫", main_menu(user_id))
+        safe_edit(call, "✅ <b>Готово! Ты записан(а) к</b> "
+                        f"{esc(MASTER_NAME)}.\n\n"
+                        f"💅 {esc(slot['service_name'] or 'услуга')}\n"
+                        f"🗓 {fmt_date(slot['date'])} в {esc(slot['time'])}\n"
+                        f"💰 {slot['price'] or 0}₽\n\n"
+                        "Если планы изменятся — нажми «❌ Отменить запись».")
+        safe_send(call.message.chat.id, "Ждём тебя! 💫", main_menu(user_id))
 
-    booking_time = datetime.strptime(f"{slot['date']} {slot['time']}", "%Y-%m-%d %H:%M")
-    remind_time = booking_time - timedelta(hours=1)
-    remind_time_str = remind_time.strftime("%H:%M")
+        booking_time = datetime.strptime(f"{slot['date']} {slot['time']}", "%Y-%m-%d %H:%M")
+        remind_time = booking_time - timedelta(hours=1)
+        remind_time_str = remind_time.strftime("%H:%M")
 
-    q_exec("INSERT INTO reminders (user_id, text, remind_time) VALUES (%s, %s, %s)",
-           (user_id, f"Напоминаем: через час у вас запись на {slot['service_name']} к {MASTER_NAME}", remind_time_str))
+        q_exec("INSERT INTO reminders (user_id, text, remind_time) VALUES (%s, %s, %s)",
+               (user_id, f"Напоминаем: через час у вас запись на {slot['service_name']} к {MASTER_NAME}", remind_time_str))
 
-    username = f"@{call.from_user.username}" if call.from_user.username else "—"
-    notify_admin("🔔 <b>НОВАЯ ЗАПИСЬ</b>\n\n"
-        f"👤 {esc(name)} ({esc(username)}, id {user_id})\n"
-        f"💅 {esc(slot['service_name'] or 'услуга')}\n"
-        f"🗓 {fmt_date(slot['date'])} в {esc(slot['time'])}\n"
-        f"💰 {slot['price'] or 0}₽ · ⏱ {slot['duration'] or 0} мин")
-    logger.info("Запись: slot=%s user=%s", slot_id, user_id)
+        username = f"@{call.from_user.username}" if call.from_user.username else "—"
+        notify_admin("🔔 <b>НОВАЯ ЗАПИСЬ</b>\n\n"
+            f"👤 {esc(name)} ({esc(username)}, id {user_id})\n"
+            f"💅 {esc(slot['service_name'] or 'услуга')}\n"
+            f"🗓 {fmt_date(slot['date'])} в {esc(slot['time'])}\n"
+            f"💰 {slot['price'] or 0}₽ · ⏱ {slot['duration'] or 0} мин")
+        logger.info("Запись: slot=%s user=%s", slot_id, user_id)
+    finally:
+        try:
+            lock.release()
+        finally:
+            _confirm_locks.pop(key, None)
 
 
 def do_unbook(call, slot_id: int) -> None:
