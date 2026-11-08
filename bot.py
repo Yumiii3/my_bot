@@ -1356,6 +1356,16 @@ def do_book(call, slot_id: int) -> None:
         logger.info("Пропущен дубль confirm: user=%s slot=%s", user_id, slot_id)
         return
     try:
+        state = get_state(user_id)
+        comment = "-"
+        if state and state.get("step") == "await_confirm":
+            saved = state.get("data") or {}
+            try:
+                saved_slot = int(saved.get("slot_id", 0))
+            except (TypeError, ValueError):
+                saved_slot = 0
+            if saved_slot == int(slot_id):
+                comment = (saved.get("comment") or "-").strip() or "-"
         clear_state(user_id)
         name = get_client_name(user_id) or (call.from_user.first_name or "Клиент")
         slot = get_slot(slot_id)
@@ -1386,12 +1396,15 @@ def do_book(call, slot_id: int) -> None:
                (user_id, f"Напоминаем: через час у вас запись на {slot['service_name']} к {MASTER_NAME}", remind_time_str))
 
         username = f"@{call.from_user.username}" if call.from_user.username else "—"
-        notify_admin("🔔 <b>НОВАЯ ЗАПИСЬ</b>\n\n"
+        admin_text = ("🔔 <b>НОВАЯ ЗАПИСЬ</b>\n\n"
             f"👤 {esc(name)} ({esc(username)}, id {user_id})\n"
             f"💅 {esc(slot['service_name'] or 'услуга')}\n"
-            f"🗓 {fmt_date(slot['date'])} в {esc(slot['time'])}\n"
-            f"💰 {slot['price'] or 0}₽ · ⏱ {slot['duration'] or 0} мин")
-        logger.info("Запись: slot=%s user=%s", slot_id, user_id)
+            f"🗓 {fmt_date(slot['date'])} в {esc(slot['time'])}\n")
+        if comment and comment != "-":
+            admin_text += f"📝 Пожелание: {esc(comment)}\n"
+        admin_text += f"💰 {slot['price'] or 0}₽ · ⏱ {slot['duration'] or 0} мин"
+        notify_admin(admin_text)
+        logger.info("Запись: slot=%s user=%s comment=%s", slot_id, user_id, comment)
     finally:
         try:
             lock.release()
