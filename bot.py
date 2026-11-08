@@ -906,6 +906,38 @@ def cmd_broadcast(message):
     safe_send(message.chat.id, f"✅ Рассылка завершена!\n📨 Отправлено: {success}\n❌ Не доставлено: {fail}")
 
 
+@bot.message_handler(commands=["dbfree"])
+def cmd_dbfree(message):
+    if not is_admin(message.from_user.id):
+        safe_send(message.chat.id, "⛔️ Доступно только мастеру.")
+        return
+    rows = q_all("""
+        SELECT s.id, s.date, s.time, s.client_id, s.client_name, sv.name AS service_name
+        FROM slots s LEFT JOIN services sv ON sv.id = s.service_id
+        WHERE s.is_booked = 1
+        ORDER BY s.date, s.time
+        LIMIT 60
+    """)
+    if not rows:
+        safe_send(message.chat.id, "📭 В базе нет ни одной занятой записи. Всё чисто.")
+        return
+    lines = [f"📋 Занято слотов: <b>{len(rows)}</b> (показаны первые 60)\n"]
+    for row in rows:
+        who = row["client_name"] or row["client_id"] or "—"
+        lines.append(f"• {fmt_date_short(row['date'])} {row['time']} — {esc(who)} · {esc(row['service_name'] or 'услуга')}")
+    lines.append("\nЧтобы освободить ВСЕ эти слоты, отправь: /dbfree да")
+    safe_send(message.chat.id, "\n".join(lines))
+
+
+@bot.message_handler(commands=["dbfree_yes"])
+def cmd_dbfree_yes(message):
+    if not is_admin(message.from_user.id):
+        safe_send(message.chat.id, "⛔️ Доступно только мастеру.")
+        return
+    rowcount = q_exec("UPDATE slots SET is_booked = 0, client_id = NULL, client_name = NULL WHERE is_booked = 1")
+    safe_send(message.chat.id, f"✅ Освобождено слотов: {rowcount}. Теперь все времена свободны.")
+
+
 @bot.message_handler(func=lambda m: m.text == "📁 Портфолио")
 def show_portfolio(message):
     chat_id = message.chat.id
