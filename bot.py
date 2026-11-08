@@ -169,13 +169,13 @@ def init_db() -> None:
                         date        TEXT    NOT NULL,
                         time        TEXT    NOT NULL,
                         is_booked   INTEGER NOT NULL DEFAULT 0,
-                        client_id   INTEGER,
+                        client_id   BIGINT,
                         client_name TEXT
                     )
                 """)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS clients (
-                        user_id  INTEGER PRIMARY KEY,
+                        user_id  BIGINT PRIMARY KEY,
                         name     TEXT,
                         username TEXT
                     )
@@ -183,7 +183,7 @@ def init_db() -> None:
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS portfolio (
                         id SERIAL PRIMARY KEY,
-                        master_id INTEGER NOT NULL,
+                        master_id BIGINT NOT NULL,
                         file_id TEXT NOT NULL,
                         caption TEXT
                     )
@@ -191,7 +191,7 @@ def init_db() -> None:
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS reminders (
                         id SERIAL PRIMARY KEY,
-                        user_id INTEGER NOT NULL,
+                        user_id BIGINT NOT NULL,
                         text TEXT NOT NULL,
                         remind_time TEXT NOT NULL,
                         is_sent INTEGER NOT NULL DEFAULT 0
@@ -206,7 +206,7 @@ def init_db() -> None:
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS questions (
                         id SERIAL PRIMARY KEY,
-                        user_id INTEGER NOT NULL,
+                        user_id BIGINT NOT NULL,
                         question_text TEXT NOT NULL,
                         answer_text TEXT,
                         is_answered INTEGER DEFAULT 0,
@@ -218,6 +218,21 @@ def init_db() -> None:
                         '💬 Вопросы и связь\n\nНапишите прямо в этот чат, и мастер ответит, как только освободится.\n\n<b>Часто спрашивают:</b>\n• можно ли с дизайном? — да\n• можно ли раньше/позже? — если есть окно, бот покажет\n• можно ли перенести запись? — да, через «Мои записи» или сообщением мастеру')
                     ON CONFLICT (key) DO NOTHING
                 """)
+                for table, column in (
+                    ("slots", "client_id"),
+                    ("clients", "user_id"),
+                    ("portfolio", "master_id"),
+                    ("reminders", "user_id"),
+                    ("questions", "user_id"),
+                ):
+                    cur.execute("SAVEPOINT migr_id")
+                    try:
+                        cur.execute(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE BIGINT")
+                        cur.execute("RELEASE SAVEPOINT migr_id")
+                        logger.info("Миграция %s.%s → BIGINT: ок", table, column)
+                    except Exception as exc:
+                        cur.execute("ROLLBACK TO SAVEPOINT migr_id")
+                        logger.warning("Миграция %s.%s → BIGINT: %s", table, column, exc)
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_slots_lookup ON slots (service_id, date, is_booked)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_slots_client ON slots (client_id, is_booked)")
                 try:
@@ -562,7 +577,7 @@ def all_bookings(only_today: bool = False) -> list:
     """, (today_str(), today_str(), time_str()))
 
 
-def book_slot(slot_id: int, user_id: int, client_name: str) -> bool:
+def book_slot(slot_id: int, user_id: int, client_name: str):
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -602,7 +617,7 @@ def book_slot(slot_id: int, user_id: int, client_name: str) -> bool:
                 return False
     except Exception as exc:
         logger.exception("Ошибка бронирования слота %s: %s", slot_id, exc)
-        return False
+        return None
 
 
 def unbook_slot(slot_id: int, user_id: int, force: bool = False) -> bool:
@@ -1247,7 +1262,11 @@ def do_book(call, slot_id: int) -> None:
         if not slot:
             safe_edit(call, "😔 Слот не найден. Попробуй записаться заново.")
             return
-        if not book_slot(slot_id, user_id, name):
+        book_result = book_slot(slot_id, user_id, name)
+        if book_result is None:
+            safe_edit(call, "⚠️ Техническая ошибка при записи. Попробуй ещё раз через минуту.")
+            return
+        if book_result is False:
             safe_edit(call, "😔 Это время занял другой клиент. Выбери другое: " + BTN_BOOK)
             return
 
