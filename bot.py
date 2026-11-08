@@ -88,6 +88,7 @@ if ADMIN_ID == 0:
 TZ_OFFSET = env_int("TZ_OFFSET", 3)
 LOCAL_TZ = timezone(timedelta(hours=TZ_OFFSET))
 MASTER_NAME = os.getenv("MASTER_NAME", "")
+MASTER_CONTACT = os.getenv("MASTER_CONTACT", "").strip()
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML", threaded=True)
 
@@ -417,7 +418,7 @@ def generate_slots(service_id: int, start_hm: str, end_hm: str,
             with conn.cursor() as cur:
                 cur.executemany(
                     "INSERT INTO slots (service_id, date, time, is_booked) VALUES (%s,%s,%s,0) "
-                    "ON CONFLICT (service_id, date, time) DO NOTHING",
+                    "ON CONFLICT DO NOTHING",
                     fresh,
                 )
         logger.info("Генерация: сервис=%s длительность=%s перерыв=%s создано=%s пропущено=%s",
@@ -453,17 +454,56 @@ def safe_send(chat_id: int, text: str, reply_markup=None):
         return None
 
 
+_screens = {}
+
+
+def _remember_screen(chat_id: int, message) -> None:
+    if message is not None:
+        _screens[chat_id] = message.message_id
+
+
+def send_screen(chat_id: int, text: str, reply_markup=None):
+    if isinstance(reply_markup, (types.ReplyKeyboardMarkup, types.ReplyKeyboardRemove, types.ForceReply)):
+        message = safe_send(chat_id, text, reply_markup)
+        _remember_screen(chat_id, message)
+        return message
+    message_id = _screens.get(chat_id)
+    if message_id:
+        try:
+            message = bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=reply_markup,
+            )
+            _remember_screen(chat_id, message)
+            return message
+        except Exception as exc:
+            if "message is not modified" in str(exc).lower():
+                return None
+            logger.debug("Не удалось изменить экран (%s), отправляю новое сообщение", exc)
+    message = safe_send(chat_id, text, reply_markup)
+    _remember_screen(chat_id, message)
+    return message
+
+
 def safe_edit(call, text: str, reply_markup=None):
     try:
-        bot.edit_message_text(
+        message = bot.edit_message_text(
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             text=text,
             reply_markup=reply_markup,
         )
+        _remember_screen(call.message.chat.id, message)
+        return message
     except Exception as exc:
+        if "message is not modified" in str(exc).lower():
+            return None
         logger.debug("edit_message_text не удался (%s), отправляю новое сообщение", exc)
-        safe_send(call.message.chat.id, text, reply_markup)
+        message = safe_send(call.message.chat.id, text, reply_markup)
+        _remember_screen(call.message.chat.id, message)
+        return message
 
 
 def notify_admin(text: str) -> None:
@@ -657,22 +697,34 @@ def book_slot(slot_id: int, user_id: int, client_name: str):
         with get_conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute("""
-                    SELECT s.id, s.service_id, s.date, s.time, s.is_booked, s.client_id,
-                           sv.duration, sv.break_min
+                    SELECT s.service_id, s.date, sv.duration, sv.break_min
                     FROM slots s
                     JOIN services sv ON sv.id = s.service_id
                     WHERE s.id = %s
-                    FOR UPDATE OF s
                 """, (slot_id,))
                 slot = cur.fetchone()
                 if not slot:
                     logger.warning("Бронь %s: слот не найден", slot_id)
                     return False
-                if slot["is_booked"]:
-                    if slot["client_id"] == user_id:
+
+                cur.execute("""
+                    SELECT id, time, is_booked, client_id
+                    FROM slots
+                    WHERE service_id = %s AND date = %s
+                    ORDER BY id
+                    FOR UPDATE
+                """, (slot["service_id"], slot["date"]))
+                rows = cur.fetchall()
+                current = next((row for row in rows if row["id"] == slot_id), None)
+                if current is None:
+                    logger.warning("Бронь %s: слот не найден", slot_id)
+                    return False
+
+                if current["is_booked"]:
+                    if current["client_id"] == user_id:
                         logger.info("Бронь %s: слот уже принадлежит %s (дубль)", slot_id, user_id)
                         return True
-                    if slot["client_id"] is None:
+                    if current["client_id"] is None:
                         logger.warning("Бронь %s: слот был занят без клиента, освобождаю "
                                        "и записываю %s", slot_id, user_id)
                         cur.execute("""
@@ -682,27 +734,15 @@ def book_slot(slot_id: int, user_id: int, client_name: str):
                         """, (user_id, client_name[:100], slot_id))
                         return cur.rowcount == 1
                     logger.warning("Бронь %s: слот занят пользователем %s",
-                                   slot_id, slot["client_id"])
+                                   slot_id, current["client_id"])
                     return False
 
-                cur.execute("""
-                    SELECT id, time
-                    FROM slots
-                    WHERE service_id = %s AND date = %s
-                    ORDER BY id
-                    FOR UPDATE
-                """, (slot["service_id"], slot["date"]))
-                cur.fetchall()
-                cur.execute("""
-                    SELECT id, time
-                    FROM slots
-                    WHERE service_id = %s AND date = %s AND is_booked = 1
-                """, (slot["service_id"], slot["date"]))
-                booked = cur.fetchall()
                 length = int(slot["duration"] or 0) + int(slot["break_min"] or 0)
-                start = hm_to_min(slot["time"])
+                start = hm_to_min(current["time"])
                 end = start + length
-                for row in booked:
+                for row in rows:
+                    if row["id"] == slot_id or not row["is_booked"]:
+                        continue
                     busy_start = hm_to_min(row["time"])
                     if start < busy_start + length and busy_start < end:
                         logger.warning("Бронь %s: пересечение с записью %s (%s)",
@@ -1150,6 +1190,16 @@ def on_callback(call):
             show_times(call, int(sid), date_iso)
         elif data.startswith("slot:"):
             start_confirm(call, int(data.split(":")[1]))
+        elif data.startswith("skip:"):
+            slot_id = int(data.split(":")[1])
+            slot = get_slot(slot_id)
+            if not slot or slot["is_booked"]:
+                clear_state(user_id)
+                safe_edit(call, "😔 Это время уже заняли. Нажми «📅 Записаться».")
+                return
+            set_state(user_id, "await_confirm", slot_id=slot_id, comment="-")
+            name = get_client_name(user_id) or "Клиент"
+            safe_edit(call, confirm_text_with_comment(slot, name, "-"), confirm_kb(slot_id))
         elif data.startswith("conf:"):
             do_book(call, int(data.split(":")[1]))
         elif data == "back:services":
@@ -1334,10 +1384,10 @@ def start_confirm(call, slot_id: int) -> None:
         return
     if name:
         set_state(user_id, "await_comment", slot_id=slot_id)
-        kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-        kb.add("➡️ Далее")
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("➡️ Пропустить", callback_data=f"skip:{slot_id}"))
         safe_edit(call,
-            "✍️ Есть ли пожелания к записи?\nЕсли нет — нажми кнопку <b>«➡️ Далее»</b> внизу.",
+            "✍️ Есть ли пожелания к записи?\nНапиши их сообщением или нажми <b>«➡️ Пропустить»</b>.",
             reply_markup=kb
         )
         return
@@ -1390,10 +1440,10 @@ def do_book(call, slot_id: int) -> None:
 
         booking_time = datetime.strptime(f"{slot['date']} {slot['time']}", "%Y-%m-%d %H:%M")
         remind_time = booking_time - timedelta(hours=1)
-        remind_time_str = remind_time.strftime("%H:%M")
+        remind_time_str = remind_time.strftime("%Y-%m-%d %H:%M")
 
         q_exec("INSERT INTO reminders (user_id, text, remind_time) VALUES (%s, %s, %s)",
-               (user_id, f"Напоминаем: через час у вас запись на {slot['service_name']} к {MASTER_NAME}", remind_time_str))
+               (user_id, f"Напоминаем: через час у вас запись на {esc(slot['service_name'])} к {esc(MASTER_NAME)}", remind_time_str))
 
         username = f"@{call.from_user.username}" if call.from_user.username else "—"
         admin_text = ("🔔 <b>НОВАЯ ЗАПИСЬ</b>\n\n"
@@ -1684,7 +1734,7 @@ def on_text(message):
     try:
         if step == "await_name":
             if len(text) < 2 or len(text) > 60:
-                safe_send(message.chat.id, "✍️ Имя должно быть от 2 до 60 символов:")
+                send_screen(message.chat.id, "✍️ Имя должно быть от 2 до 60 символов:")
                 return
             save_client(user_id, text, message.from_user.username or "")
             clear_state(user_id)
@@ -1693,10 +1743,10 @@ def on_text(message):
                 safe_send(message.chat.id, "😔 Это время уже заняли.", main_menu(user_id))
                 return
             set_state(user_id, "await_comment", slot_id=data["slot_id"])
-            kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-            kb.add("➡️ Далее")
-            safe_send(message.chat.id,
-                "✍️ Есть ли пожелания к записи?\nЕсли нет — нажми кнопку <b>«➡️ Далее»</b> внизу.",
+            kb = types.InlineKeyboardMarkup()
+            kb.add(types.InlineKeyboardButton("➡️ Пропустить", callback_data=f"skip:{data['slot_id']}"))
+            send_screen(message.chat.id,
+                "✍️ Есть ли пожелания к записи?\nНапиши их сообщением или нажми <b>«➡️ Пропустить»</b>.",
                 reply_markup=kb
             )
             return
@@ -1706,10 +1756,15 @@ def on_text(message):
                 comment = "-"
             else:
                 comment = text
-            set_state(user_id, "await_confirm", slot_id=data["slot_id"], comment=comment)
             slot = get_slot(data["slot_id"])
+            if not slot:
+                clear_state(user_id)
+                send_screen(message.chat.id, "😔 Слот не найден. Начни запись заново: /start",
+                            main_menu(user_id))
+                return
+            set_state(user_id, "await_confirm", slot_id=data["slot_id"], comment=comment)
             name = get_client_name(user_id) or "Клиент"
-            safe_send(message.chat.id, confirm_text_with_comment(slot, name, comment), confirm_kb(slot["id"]))
+            send_screen(message.chat.id, confirm_text_with_comment(slot, name, comment), confirm_kb(slot["id"]))
             return
 
         if step == "await_client_question":
@@ -1734,10 +1789,10 @@ def on_text(message):
                 clear_state(user_id)
                 return
             if len(text) < 2 or len(text) > 80:
-                safe_send(message.chat.id, "Название должно быть 2–80 символов:")
+                send_screen(message.chat.id, "Название должно быть 2–80 символов:")
                 return
             set_state(user_id, "svc_duration", name=text)
-            safe_send(message.chat.id, "Шаг 2/3. Длительность в минутах:")
+            send_screen(message.chat.id, "Шаг 2/3. Длительность в минутах:")
             return
 
         if step == "svc_duration":
@@ -1745,10 +1800,10 @@ def on_text(message):
                 clear_state(user_id)
                 return
             if not text.isdigit() or not (5 <= int(text) <= 600):
-                safe_send(message.chat.id, "Нужно число от 5 до 600:")
+                send_screen(message.chat.id, "Нужно число от 5 до 600:")
                 return
             set_state(user_id, "svc_price", name=data["name"], duration=int(text))
-            safe_send(message.chat.id, "Шаг 3/3. Цена в рублях:")
+            send_screen(message.chat.id, "Шаг 3/3. Цена в рублях:")
             return
 
         if step == "svc_price":
@@ -1757,7 +1812,7 @@ def on_text(message):
                 return
             digits = text.replace(" ", "").replace("₽", "")
             if not digits.isdigit() or int(digits) > 1_000_000:
-                safe_send(message.chat.id, "Нужно целое число:")
+                send_screen(message.chat.id, "Нужно целое число:")
                 return
             price = int(digits)
             q_exec("INSERT INTO services (name, duration, price) VALUES (%s,%s,%s)",
@@ -1775,13 +1830,13 @@ def on_text(message):
                 return
             date_iso = parse_date_input(text)
             if not date_iso:
-                safe_send(message.chat.id, "❗️ Не понял дату. Примеры: завтра, 15.03, 2025-03-15")
+                send_screen(message.chat.id, "❗️ Не понял дату. Примеры: завтра, 15.03, 2025-03-15")
                 return
             if date_iso < today_str():
-                safe_send(message.chat.id, "❗️ Дата в прошлом.")
+                send_screen(message.chat.id, "❗️ Дата в прошлом.")
                 return
             set_state(user_id, "slot_time", service_id=data["service_id"], date=date_iso)
-            safe_send(message.chat.id,
+            send_screen(message.chat.id,
                       f"🗓 Дата: <b>{fmt_date(date_iso)}</b>\n\n"
                       "Шаг 2/2. Введи время (можно несколько через запятую):\n10:00, 11:30, 13:00")
             return
@@ -1792,7 +1847,7 @@ def on_text(message):
                 return
             times, bad = parse_times_input(text)
             if not times:
-                safe_send(message.chat.id, "❗️ Не понял время. Формат ЧЧ:ММ")
+                send_screen(message.chat.id, "❗️ Не понял время. Формат ЧЧ:ММ")
                 return
             service_id = int(data["service_id"])
             date_iso = data["date"]
@@ -1827,10 +1882,10 @@ def on_text(message):
                 return
             rng = parse_hours_range(text)
             if not rng:
-                safe_send(message.chat.id, "❗️ Формат: <code>10:00-19:00</code>")
+                send_screen(message.chat.id, "❗️ Формат: <code>10:00-19:00</code>")
                 return
             set_state(user_id, "gen_step", service_id=data["service_id"], start=rng[0], end=rng[1])
-            safe_send(message.chat.id,
+            send_screen(message.chat.id,
                       f"🕒 Часы: <b>{rng[0]}–{rng[1]}</b>\n\n"
                       "Шаг 2/3. Перерыв между записями, мин:\n<code>0</code> · <code>10</code> · <code>15</code> · <code>20</code>")
             return
@@ -1840,11 +1895,11 @@ def on_text(message):
                 clear_state(user_id)
                 return
             if not text.isdigit() or not (0 <= int(text) <= 120):
-                safe_send(message.chat.id, "Нужно число от 0 до 120:")
+                send_screen(message.chat.id, "Нужно число от 0 до 120:")
                 return
             set_state(user_id, "gen_days", service_id=data["service_id"],
                       start=data["start"], end=data["end"], break_min=int(text))
-            safe_send(message.chat.id,
+            send_screen(message.chat.id,
                       "Шаг 3/3. На сколько дней вперёд? (1–60)\n\n"
                       "Добавь <b>будни</b>, чтобы пропустить Сб и Вс:\n"
                       "<code>7</code> · <code>14</code> · <code>14 будни</code>")
@@ -1857,13 +1912,13 @@ def on_text(message):
             only_weekdays = "будн" in text.lower()
             digits = re.sub(r"\D", "", text)
             if not digits or not (1 <= int(digits) <= 60):
-                safe_send(message.chat.id, "Нужно число от 1 до 60.")
+                send_screen(message.chat.id, "Нужно число от 1 до 60.")
                 return
             service_id = int(data["service_id"])
             service = get_service(service_id)
             if not service:
                 clear_state(user_id)
-                safe_send(message.chat.id, "Услуга не найдена.")
+                send_screen(message.chat.id, "Услуга не найдена.")
                 return
             set_state(user_id, "gen_confirm", service_id=service_id,
                       start=data["start"], end=data["end"],
@@ -1875,7 +1930,7 @@ def on_text(message):
             days_line = f"🗓 Дней: {int(digits)}"
             if only_weekdays:
                 days_line += " (только будни)"
-            safe_send(message.chat.id,
+            send_screen(message.chat.id,
                 "⚠️ <b>Пересоздание расписания</b>\n\n"
                 f"💅 {esc(service['name'])}\n"
                 f"🕒 {data['start']}–{data['end']}\n"
@@ -1905,8 +1960,8 @@ def on_other_content(message):
 
 # ---------- Планировщик ----------
 def check_reminders():
-    tz = pytz.timezone('Europe/Moscow')
-    now = datetime.now(tz).strftime("%H:%M")
+    now = now_local().strftime("%Y-%m-%d %H:%M")
+    contact = f"\n\n📞 Связь с мастером: {esc(MASTER_CONTACT)}" if MASTER_CONTACT else ""
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("SELECT id, user_id, text FROM reminders WHERE remind_time=%s AND is_sent=0", (now,))
@@ -1917,8 +1972,7 @@ def check_reminders():
                 text = row["text"]
                 try:
                     bot.send_message(user_id,
-                        f"⏰ <b>Напоминание:</b> {text}\n\n"
-                        f"📞 Связь с мастером: @nickname",
+                        f"⏰ <b>Напоминание:</b> {text}{contact}",
                         parse_mode='HTML')
                 except Exception as e:
                     print(f"Ошибка отправки: {e}")
@@ -1929,7 +1983,10 @@ def check_reminders():
 def run_scheduler():
     schedule.every(1).minutes.do(check_reminders)
     while True:
-        schedule.run_pending()
+        try:
+            schedule.run_pending()
+        except Exception as exc:
+            logger.exception("Планировщик: %s", exc)
         time.sleep(1)
 
 
