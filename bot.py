@@ -243,6 +243,9 @@ def init_db() -> None:
                 except Exception as exc:
                     cur.execute("ROLLBACK TO SAVEPOINT migr_break")
                     logger.warning("Миграция services.break_min: %s", exc)
+                cur.execute("DELETE FROM reminders WHERE is_sent = 0 AND length(remind_time) <> 16")
+                if cur.rowcount:
+                    logger.info("Очищено старых напоминаний: %s", cur.rowcount)
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_slots_lookup ON slots (service_id, date, is_booked)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_slots_client ON slots (client_id, is_booked)")
                 try:
@@ -1034,6 +1037,27 @@ def cmd_stats(message):
     safe_send(message.chat.id, "\n".join(lines), main_menu(message.from_user.id))
 
 
+@bot.message_handler(commands=["reminders"])
+def cmd_reminders(message):
+    if not is_admin(message.from_user.id):
+        safe_send(message.chat.id, "⛔️ Доступно только мастеру.")
+        return
+    rows = q_all("""
+        SELECT user_id, text, remind_time
+        FROM reminders
+        WHERE is_sent = 0
+        ORDER BY remind_time
+        LIMIT 50
+    """)
+    if not rows:
+        safe_send(message.chat.id, "📭 Нет ожидающих напоминаний.")
+        return
+    lines = ["⏰ <b>Ожидающие напоминания:</b>\n"]
+    for row in rows:
+        lines.append(f"• {esc(row['remind_time'])} — {esc(row['text'])} (id {row['user_id']})")
+    safe_send(message.chat.id, "\n".join(lines))
+
+
 @bot.message_handler(commands=["broadcast"])
 def cmd_broadcast(message):
     if not is_admin(message.from_user.id):
@@ -1442,8 +1466,9 @@ def do_book(call, slot_id: int) -> None:
         remind_time = booking_time - timedelta(hours=1)
         remind_time_str = remind_time.strftime("%Y-%m-%d %H:%M")
 
-        q_exec("INSERT INTO reminders (user_id, text, remind_time) VALUES (%s, %s, %s)",
-               (user_id, f"Напоминаем: через час у вас запись на {esc(slot['service_name'])} к {esc(MASTER_NAME)}", remind_time_str))
+        if remind_time > now_local().replace(tzinfo=None):
+            q_exec("INSERT INTO reminders (user_id, text, remind_time) VALUES (%s, %s, %s)",
+                   (user_id, f"У вас запись на {esc(slot['service_name'])} к {esc(MASTER_NAME)}", remind_time_str))
 
         username = f"@{call.from_user.username}" if call.from_user.username else "—"
         admin_text = ("🔔 <b>НОВАЯ ЗАПИСЬ</b>\n\n"
@@ -1694,7 +1719,8 @@ def handle_admin_callback(call, data: str) -> None:
             "✧ <b>Рассылка:</b>\n"
             "📢 /broadcast — рассылка\n\n"
             "✧ <b>Статистика:</b>\n"
-            "📊 /stats — статистика\n\n"
+            "📊 /stats — статистика\n"
+            "⏰ /reminders — ожидающие напоминания\n\n"
             "✧ <b>Настройки:</b>\n"
             "⚙️ /admin — админ-панель\n"
             "🆔 /myid — свой ID\n\n"
@@ -1960,16 +1986,30 @@ def on_other_content(message):
 
 # ---------- Планировщик ----------
 def check_reminders():
-    now = now_local().strftime("%Y-%m-%d %H:%M")
+    now = now_local().replace(tzinfo=None)
+    now_str = now.strftime("%Y-%m-%d %H:%M")
     contact = f"\n\n📞 Связь с мастером: {esc(MASTER_CONTACT)}" if MASTER_CONTACT else ""
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT id, user_id, text FROM reminders WHERE remind_time=%s AND is_sent=0", (now,))
+            cur.execute("""
+                SELECT id, user_id, text, remind_time
+                FROM reminders
+                WHERE is_sent = 0 AND remind_time <= %s
+                ORDER BY remind_time
+            """, (now_str,))
             due = cur.fetchall()
             for row in due:
                 r_id = row["id"]
                 user_id = row["user_id"]
                 text = row["text"]
+                try:
+                    remind_dt = datetime.strptime(row["remind_time"], "%Y-%m-%d %H:%M")
+                except (TypeError, ValueError):
+                    cur.execute("UPDATE reminders SET is_sent=1 WHERE id=%s", (r_id,))
+                    continue
+                if now >= remind_dt + timedelta(minutes=15):
+                    cur.execute("UPDATE reminders SET is_sent=1 WHERE id=%s", (r_id,))
+                    continue
                 try:
                     bot.send_message(user_id,
                         f"⏰ <b>Напоминание:</b> {text}{contact}",
