@@ -159,7 +159,8 @@ def init_db() -> None:
                         id       SERIAL PRIMARY KEY,
                         name     TEXT    NOT NULL,
                         duration INTEGER NOT NULL DEFAULT 60,
-                        price    INTEGER NOT NULL DEFAULT 0
+                        price    INTEGER NOT NULL DEFAULT 0,
+                        break_min INTEGER NOT NULL DEFAULT 0
                     )
                 """)
                 cur.execute("""
@@ -233,6 +234,14 @@ def init_db() -> None:
                     except Exception as exc:
                         cur.execute("ROLLBACK TO SAVEPOINT migr_id")
                         logger.warning("Миграция %s.%s → BIGINT: %s", table, column, exc)
+                cur.execute("SAVEPOINT migr_break")
+                try:
+                    cur.execute("ALTER TABLE services ADD COLUMN IF NOT EXISTS break_min INTEGER NOT NULL DEFAULT 0")
+                    cur.execute("RELEASE SAVEPOINT migr_break")
+                    logger.info("Миграция services.break_min: ок")
+                except Exception as exc:
+                    cur.execute("ROLLBACK TO SAVEPOINT migr_break")
+                    logger.warning("Миграция services.break_min: %s", exc)
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_slots_lookup ON slots (service_id, date, is_booked)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_slots_client ON slots (client_id, is_booked)")
                 try:
@@ -263,6 +272,11 @@ def today_str() -> str:
 
 def time_str() -> str:
     return now_local().strftime("%H:%M")
+
+
+def hm_to_min(hm) -> int:
+    parts = str(hm or "0:0").split(":")
+    return int(parts[0]) * 60 + int(parts[1])
 
 
 def fmt_date(date_iso: str) -> str:
@@ -343,7 +357,12 @@ def parse_hours_range(text: str):
 
 
 def generate_slots(service_id: int, start_hm: str, end_hm: str,
-                   step_min: int, days: int, only_weekdays: bool = False):
+                   break_min: int, days: int, only_weekdays: bool = False):
+    service = get_service(service_id)
+    duration = int((service or {}).get("duration") or 0)
+    if duration <= 0:
+        return 0, 0, 0, False
+    step_min = duration + max(0, int(break_min))
     t_start = datetime.strptime(start_hm, "%H:%M")
     t_end = datetime.strptime(end_hm, "%H:%M")
     today = now_local().date()
@@ -356,10 +375,17 @@ def generate_slots(service_id: int, start_hm: str, end_hm: str,
             continue
         day_iso = day.isoformat()
         added_today = False
+        times = []
         cur = t_start
-        while cur + timedelta(minutes=step_min) <= t_end:
-            hm = cur.strftime("%H:%M")
+        while cur + timedelta(minutes=duration) <= t_end:
+            times.append(cur.strftime("%H:%M"))
             cur += timedelta(minutes=step_min)
+        final_slot = t_end - timedelta(minutes=duration)
+        if final_slot >= t_start:
+            final_hm = final_slot.strftime("%H:%M")
+            if final_hm not in times:
+                times.append(final_hm)
+        for hm in times:
             if day == today and hm <= now_hm:
                 continue
             if len(rows) >= MAX_GEN_SLOTS:
@@ -394,7 +420,8 @@ def generate_slots(service_id: int, start_hm: str, end_hm: str,
                     "ON CONFLICT (service_id, date, time) DO NOTHING",
                     fresh,
                 )
-        logger.info("Генерация: сервис=%s создано=%s пропущено=%s", service_id, len(fresh), skipped)
+        logger.info("Генерация: сервис=%s длительность=%s перерыв=%s создано=%s пропущено=%s",
+                    service_id, duration, break_min, len(fresh), skipped)
         return len(fresh), skipped, days_used, capped
     except Exception as exc:
         logger.exception("Ошибка генерации слотов: %s", exc)
@@ -511,7 +538,7 @@ def admin_menu_kb() -> types.InlineKeyboardMarkup:
 # ==========================================================
 
 def get_service(service_id: int):
-    return q_one("SELECT id, name, duration, price FROM services WHERE id = %s", (service_id,))
+    return q_one("SELECT id, name, duration, price, break_min FROM services WHERE id = %s", (service_id,))
 
 
 def get_slot(slot_id: int):
@@ -524,26 +551,74 @@ def get_slot(slot_id: int):
     """, (slot_id,))
 
 
+def _windows_for(rows, length: int) -> list:
+    windows = []
+    for row in rows:
+        start = hm_to_min(row["time"])
+        windows.append((start, start + length))
+    return windows
+
+
+def _time_free(hm: str, length: int, windows: list) -> bool:
+    start = hm_to_min(hm)
+    end = start + length
+    for win_start, win_end in windows:
+        if start < win_end and win_start < end:
+            return False
+    return True
+
+
 def free_dates(service_id: int) -> list:
-    return q_all("""
-        SELECT date, COUNT(*) AS cnt
+    service = get_service(service_id)
+    if not service:
+        return []
+    length = int(service["duration"] or 0) + int(service["break_min"] or 0)
+    if length <= 0:
+        return []
+    free = q_all("""
+        SELECT date, time
         FROM slots
         WHERE service_id = %s AND is_booked = 0
           AND (date > %s OR (date = %s AND time >= %s))
-        GROUP BY date
-        ORDER BY date
-        LIMIT 30
+        ORDER BY date, time
     """, (service_id, today_str(), today_str(), time_str()))
+    booked = q_all("""
+        SELECT date, time
+        FROM slots
+        WHERE service_id = %s AND is_booked = 1 AND date >= %s
+    """, (service_id, today_str()))
+    busy = {}
+    for row in booked:
+        busy.setdefault(row["date"], []).append(row)
+    counts = {}
+    for row in free:
+        day = row["date"]
+        if _time_free(row["time"], length, _windows_for(busy.get(day, []), length)):
+            counts[day] = counts.get(day, 0) + 1
+    result = [{"date": day, "cnt": cnt} for day, cnt in sorted(counts.items())]
+    return result[:30]
 
 
 def free_slots_on_date(service_id: int, date_iso: str) -> list:
-    return q_all("""
+    service = get_service(service_id)
+    if not service:
+        return []
+    length = int(service["duration"] or 0) + int(service["break_min"] or 0)
+    if length <= 0:
+        return []
+    rows = q_all("""
         SELECT id, time
         FROM slots
         WHERE service_id = %s AND date = %s AND is_booked = 0
           AND (date > %s OR (date = %s AND time >= %s))
         ORDER BY time
     """, (service_id, date_iso, today_str(), today_str(), time_str()))
+    booked = q_all("""
+        SELECT time FROM slots
+        WHERE service_id = %s AND date = %s AND is_booked = 1
+    """, (service_id, date_iso))
+    windows = _windows_for(booked, length)
+    return [row for row in rows if _time_free(row["time"], length, windows)]
 
 
 def my_bookings(user_id: int) -> list:
@@ -580,41 +655,66 @@ def all_bookings(only_today: bool = False) -> list:
 def book_slot(slot_id: int, user_id: int, client_name: str):
     try:
         with get_conn() as conn:
-            with conn.cursor() as cur:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT s.id, s.service_id, s.date, s.time, s.is_booked, s.client_id,
+                           sv.duration, sv.break_min
+                    FROM slots s
+                    JOIN services sv ON sv.id = s.service_id
+                    WHERE s.id = %s
+                    FOR UPDATE OF s
+                """, (slot_id,))
+                slot = cur.fetchone()
+                if not slot:
+                    logger.warning("Бронь %s: слот не найден", slot_id)
+                    return False
+                if slot["is_booked"]:
+                    if slot["client_id"] == user_id:
+                        logger.info("Бронь %s: слот уже принадлежит %s (дубль)", slot_id, user_id)
+                        return True
+                    if slot["client_id"] is None:
+                        logger.warning("Бронь %s: слот был занят без клиента, освобождаю "
+                                       "и записываю %s", slot_id, user_id)
+                        cur.execute("""
+                            UPDATE slots
+                            SET client_id = %s, client_name = %s
+                            WHERE id = %s
+                        """, (user_id, client_name[:100], slot_id))
+                        return cur.rowcount == 1
+                    logger.warning("Бронь %s: слот занят пользователем %s",
+                                   slot_id, slot["client_id"])
+                    return False
+
+                cur.execute("""
+                    SELECT id, time
+                    FROM slots
+                    WHERE service_id = %s AND date = %s
+                    ORDER BY id
+                    FOR UPDATE
+                """, (slot["service_id"], slot["date"]))
+                cur.fetchall()
+                cur.execute("""
+                    SELECT id, time
+                    FROM slots
+                    WHERE service_id = %s AND date = %s AND is_booked = 1
+                """, (slot["service_id"], slot["date"]))
+                booked = cur.fetchall()
+                length = int(slot["duration"] or 0) + int(slot["break_min"] or 0)
+                start = hm_to_min(slot["time"])
+                end = start + length
+                for row in booked:
+                    busy_start = hm_to_min(row["time"])
+                    if start < busy_start + length and busy_start < end:
+                        logger.warning("Бронь %s: пересечение с записью %s (%s)",
+                                       slot_id, row["id"], row["time"])
+                        return False
+
                 cur.execute("""
                     UPDATE slots
                     SET is_booked = 1, client_id = %s, client_name = %s
                     WHERE id = %s AND is_booked = 0
                 """, (user_id, client_name[:100], slot_id))
-                if cur.rowcount == 1:
-                    return True
-                # Слот уже занят. Выясняем, кем.
-                cur.execute("SELECT is_booked, client_id FROM slots WHERE id = %s", (slot_id,))
-                row = cur.fetchone()
-                if row:
-                    is_booked, owner_id = row[0], row[1]
-                    if is_booked and owner_id == user_id:
-                        # Дубль клика / повторная доставка того же confirm —
-                        # слот уже принадлежит этому клиенту, ошибка не нужна.
-                        logger.info("Бронь %s: слот уже принадлежит %s (дубль), считаю успешной",
-                                    slot_id, user_id)
-                        return True
-                    if is_booked and owner_id is None:
-                        # «Мусорная» бронь: слот занят, но клиента нет
-                        # (сбой прошлых запусков). Освобождаем и записываем нового клиента.
-                        logger.warning("Бронь %s: слот был занят без клиента, освобождаю "
-                                       "и записываю %s", slot_id, user_id)
-                        cur.execute("""
-                            UPDATE slots
-                            SET is_booked = 1, client_id = %s, client_name = %s
-                            WHERE id = %s
-                        """, (user_id, client_name[:100], slot_id))
-                        return cur.rowcount == 1
-                    logger.warning("Бронь %s: слот занят пользователем %s (конфликт)",
-                                   slot_id, owner_id)
-                else:
-                    logger.warning("Бронь %s: слот не найден", slot_id)
-                return False
+                return cur.rowcount == 1
     except Exception as exc:
         logger.exception("Ошибка бронирования слота %s: %s", slot_id, exc)
         return None
@@ -1470,6 +1570,48 @@ def handle_admin_callback(call, data: str) -> None:
         kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="adm:menu"))
         safe_edit(call, "📅 <b>Расписание на неделе</b>\n\nДля какой услуги?", kb)
 
+    elif data == "adm:gen_go":
+        state = get_state(user_id)
+        if not state or state.get("step") != "gen_confirm":
+            safe_edit(call, "⚠️ Данные устарели. Запусти расписание заново.", admin_menu_kb())
+            return
+        d = state["data"]
+        clear_state(user_id)
+        service_id = int(d["service_id"])
+        service = get_service(service_id)
+        if not service:
+            safe_edit(call, "Услуга не найдена.", admin_menu_kb())
+            return
+        break_min = int(d["break_min"])
+        q_exec("UPDATE services SET break_min=%s WHERE id=%s", (break_min, service_id))
+        booked = q_one("SELECT COUNT(*) AS cnt FROM slots WHERE service_id=%s AND is_booked=1",
+                       (service_id,))
+        booked_count = int(booked["cnt"]) if booked else 0
+        deleted = q_exec("DELETE FROM slots WHERE service_id=%s AND is_booked=0", (service_id,))
+        added, skipped, days_used, capped = generate_slots(
+            service_id, d["start"], d["end"], break_min, int(d["days"]),
+            bool(d["only_weekdays"]))
+        report = [f"📅 <b>Расписание обновлено: {esc(service['name'])}</b>",
+                  f"🕒 {d['start']}–{d['end']} · услуга {service['duration']} мин · перерыв {break_min} мин",
+                  f"🗓 Дней: {days_used}" + (" (только будни)" if d["only_weekdays"] else ""),
+                  ""]
+        if deleted >= 0:
+            report.append(f"🗑 Удалено старых свободных слотов: {deleted}")
+        report.append(f"✅ Создано слотов: <b>{added}</b>")
+        if booked_count:
+            report.append(f"💾 Сохранено записей клиентов: {booked_count}")
+        if skipped:
+            report.append(f"⏭ Не создано (совпало с записями): {skipped}")
+        if capped:
+            report.append(f"⚠️ Лимит {MAX_GEN_SLOTS} слотов за раз.")
+        if not added and not skipped:
+            report.append("😕 Слоты не созданы — проверь рабочие часы и длительность услуги.")
+        safe_edit(call, "\n".join(report), admin_menu_kb())
+
+    elif data == "adm:gen_cancel":
+        clear_state(user_id)
+        safe_edit(call, "🚫 Расписание не изменено.", admin_menu_kb())
+
     elif data.startswith("gsvc:"):
         service_id = int(data.split(":")[1])
         service = get_service(service_id)
@@ -1677,18 +1819,18 @@ def on_text(message):
             set_state(user_id, "gen_step", service_id=data["service_id"], start=rng[0], end=rng[1])
             safe_send(message.chat.id,
                       f"🕒 Часы: <b>{rng[0]}–{rng[1]}</b>\n\n"
-                      "Шаг 2/3. Интервал в минутах:\n<code>30</code> · <code>45</code> · <code>60</code> · <code>90</code>")
+                      "Шаг 2/3. Перерыв между записями, мин:\n<code>0</code> · <code>10</code> · <code>15</code> · <code>20</code>")
             return
 
         if step == "gen_step":
             if not is_admin(user_id):
                 clear_state(user_id)
                 return
-            if not text.isdigit() or not (10 <= int(text) <= 480):
-                safe_send(message.chat.id, "Нужно число от 10 до 480:")
+            if not text.isdigit() or not (0 <= int(text) <= 120):
+                safe_send(message.chat.id, "Нужно число от 0 до 120:")
                 return
             set_state(user_id, "gen_days", service_id=data["service_id"],
-                      start=data["start"], end=data["end"], interval=int(text))
+                      start=data["start"], end=data["end"], break_min=int(text))
             safe_send(message.chat.id,
                       "Шаг 3/3. На сколько дней вперёд? (1–60)\n\n"
                       "Добавь <b>будни</b>, чтобы пропустить Сб и Вс:\n"
@@ -1704,24 +1846,33 @@ def on_text(message):
             if not digits or not (1 <= int(digits) <= 60):
                 safe_send(message.chat.id, "Нужно число от 1 до 60.")
                 return
-            clear_state(user_id)
             service_id = int(data["service_id"])
             service = get_service(service_id)
-            added, skipped, days_used, capped = generate_slots(service_id, data["start"], data["end"],
-                int(data["interval"]), int(digits), only_weekdays)
-            report = [f"📅 <b>{esc(service['name'] if service else 'услуга')}</b>",
-                      f"🕒 {data['start']}–{data['end']} · шаг {data['interval']} мин",
-                      f"🗓 Дней задействовано: {days_used}" + (" (только будни)" if only_weekdays else ""),
-                      ""]
-            report.append(f"✅ Создано слотов: <b>{added}</b>")
-            if skipped:
-                report.append(f"⏭ Пропущено (уже были): {skipped}")
-            if capped:
-                report.append(f"⚠️ Лимит {MAX_GEN_SLOTS} слотов за раз.")
-            if not added and not skipped:
-                report.append("😕 Ничего не создано.")
-            safe_send(message.chat.id, "\n".join(report))
-            safe_send(message.chat.id, "⚙️ Меню:", admin_menu_kb())
+            if not service:
+                clear_state(user_id)
+                safe_send(message.chat.id, "Услуга не найдена.")
+                return
+            set_state(user_id, "gen_confirm", service_id=service_id,
+                      start=data["start"], end=data["end"],
+                      break_min=int(data["break_min"]), days=int(digits),
+                      only_weekdays=only_weekdays)
+            kb = types.InlineKeyboardMarkup()
+            kb.add(types.InlineKeyboardButton("✅ Продолжить", callback_data="adm:gen_go"))
+            kb.add(types.InlineKeyboardButton("🚫 Отмена", callback_data="adm:gen_cancel"))
+            days_line = f"🗓 Дней: {int(digits)}"
+            if only_weekdays:
+                days_line += " (только будни)"
+            safe_send(message.chat.id,
+                "⚠️ <b>Пересоздание расписания</b>\n\n"
+                f"💅 {esc(service['name'])}\n"
+                f"🕒 {data['start']}–{data['end']}\n"
+                f"⏱ Услуга: {service['duration']} мин\n"
+                f"☕️ Перерыв: {int(data['break_min'])} мин\n"
+                f"{days_line}\n\n"
+                "Все старые свободные слоты этой услуги будут удалены и созданы заново.\n"
+                "Записи клиентов сохранятся.\n\n"
+                "Продолжить?",
+                reply_markup=kb)
             return
 
         clear_state(user_id)
