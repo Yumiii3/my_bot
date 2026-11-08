@@ -179,7 +179,8 @@ def init_db() -> None:
                     CREATE TABLE IF NOT EXISTS clients (
                         user_id  BIGINT PRIMARY KEY,
                         name     TEXT,
-                        username TEXT
+                        username TEXT,
+                        notes    TEXT NOT NULL DEFAULT ''
                     )
                 """)
                 cur.execute("""
@@ -243,6 +244,14 @@ def init_db() -> None:
                 except Exception as exc:
                     cur.execute("ROLLBACK TO SAVEPOINT migr_break")
                     logger.warning("Миграция services.break_min: %s", exc)
+                cur.execute("SAVEPOINT migr_notes")
+                try:
+                    cur.execute("ALTER TABLE clients ADD COLUMN IF NOT EXISTS notes TEXT NOT NULL DEFAULT ''")
+                    cur.execute("RELEASE SAVEPOINT migr_notes")
+                    logger.info("Миграция clients.notes: ок")
+                except Exception as exc:
+                    cur.execute("ROLLBACK TO SAVEPOINT migr_notes")
+                    logger.warning("Миграция clients.notes: %s", exc)
                 cur.execute("DELETE FROM reminders WHERE is_sent = 0 AND length(remind_time) <> 16")
                 if cur.rowcount:
                     logger.info("Очищено старых напоминаний: %s", cur.rowcount)
@@ -255,6 +264,7 @@ def init_db() -> None:
         logger.info("База данных PostgreSQL готова")
     except Exception as exc:
         logger.exception("КРИТИЧЕСКАЯ ошибка init_db: %s", exc)
+        alert_admin_error("Инициализация базы", exc)
         raise
 
 
@@ -509,9 +519,42 @@ def safe_edit(call, text: str, reply_markup=None):
         return message
 
 
-def notify_admin(text: str) -> None:
+def notify_admin(text: str, reply_markup=None) -> None:
     if ADMIN_ID:
-        safe_send(ADMIN_ID, text)
+        safe_send(ADMIN_ID, text, reply_markup)
+
+
+_error_alert_times: dict = {}
+
+
+def alert_admin_error(context: str, exc: Exception = None) -> None:
+    if not ADMIN_ID:
+        return
+    now_ts = time.time()
+    if now_ts - _error_alert_times.get("__global__", 0) < 60:
+        return
+    if now_ts - _error_alert_times.get(context, 0) < 300:
+        return
+    _error_alert_times["__global__"] = now_ts
+    _error_alert_times[context] = now_ts
+    if len(_error_alert_times) > 200:
+        _error_alert_times.clear()
+        _error_alert_times["__global__"] = now_ts
+        _error_alert_times[context] = now_ts
+    detail = ""
+    if exc is not None:
+        detail = f"{type(exc).__name__}: {exc}"[:700]
+        for secret in (TOKEN, DATABASE_URL):
+            if secret:
+                detail = detail.replace(secret, "***")
+        detail = re.sub(r"(?i)(password|pwd)=\S+", r"\1=***", detail)
+        detail = re.sub(r"postgres(?:ql)?://\S+", "postgres://***", detail)
+    text = (f"⚠️ <b>Ошибка в боте</b>\n\n"
+            f"🕒 {now_local().strftime('%d.%m.%Y %H:%M:%S')}\n"
+            f"📍 {esc(context)}")
+    if detail:
+        text += f"\n\n<code>{esc(detail)}</code>"
+    safe_send(ADMIN_ID, text)
 
 
 # ==========================================================
@@ -569,6 +612,7 @@ def admin_menu_kb() -> types.InlineKeyboardMarkup:
     kb.add(types.InlineKeyboardButton("📆 Записи на сегодня", callback_data="adm:today"))
     kb.add(types.InlineKeyboardButton("📅 Расписание на неделю", callback_data="adm:gen_week"))
     kb.add(types.InlineKeyboardButton("📚 Все записи", callback_data="adm:all"))
+    kb.add(types.InlineKeyboardButton("👥 Клиенты", callback_data="adm:clients"))
     kb.add(types.InlineKeyboardButton("🧾 Добавить услугу", callback_data="adm:add_service"))
     kb.add(types.InlineKeyboardButton("❌ Удалить услугу", callback_data="adm:del_service"))
     kb.add(types.InlineKeyboardButton("📊 Статистика", callback_data="adm:stats"))
@@ -760,6 +804,7 @@ def book_slot(slot_id: int, user_id: int, client_name: str):
                 return cur.rowcount == 1
     except Exception as exc:
         logger.exception("Ошибка бронирования слота %s: %s", slot_id, exc)
+        alert_admin_error(f"Бронирование слота {slot_id}", exc)
         return None
 
 
@@ -791,6 +836,77 @@ def save_client(user_id: int, name: str, username: str = "") -> None:
 def get_client_name(user_id: int):
     row = q_one("SELECT name FROM clients WHERE user_id = %s", (user_id,))
     return row["name"] if row and row["name"] else None
+
+
+def get_client(user_id: int):
+    return q_one("SELECT user_id, name, username, notes FROM clients WHERE user_id = %s", (user_id,))
+
+
+def set_client_note(user_id: int, note: str) -> None:
+    q_exec("""
+        INSERT INTO clients (user_id, notes) VALUES (%s, %s)
+        ON CONFLICT (user_id) DO UPDATE SET notes = excluded.notes
+    """, (user_id, (note or "").strip()[:1000]))
+
+
+def client_stats(user_id: int):
+    today = today_str()
+    return q_one("""
+        SELECT COUNT(*) AS visits,
+               MAX(s.date) FILTER (WHERE s.date <= %s) AS last_date,
+               MIN(s.date) FILTER (WHERE s.date >= %s) AS next_date,
+               COALESCE(SUM(sv.price), 0) AS total
+        FROM slots s
+        LEFT JOIN services sv ON sv.id = s.service_id
+        WHERE s.is_booked = 1 AND s.client_id = %s
+    """, (today, today, user_id))
+
+
+def client_card_text(client) -> str:
+    user_id = client["user_id"]
+    name = (client["name"] or "").strip() or "Клиент"
+    username = f"@{client['username']}" if client.get("username") else "—"
+    stats = client_stats(user_id) or {}
+    visits = stats.get("visits") or 0
+    last_date = fmt_date(stats["last_date"]) if stats.get("last_date") else "—"
+    next_date = fmt_date(stats["next_date"]) if stats.get("next_date") else "—"
+    total = stats.get("total") or 0
+    note = (client.get("notes") or "").strip()
+    return (f"👤 <b>{esc(name)}</b>\n"
+            f"{esc(username)} · id {user_id}\n\n"
+            f"📅 Записей: <b>{visits}</b>\n"
+            f"🕓 Последний визит: {esc(last_date)}\n"
+            f"⏭ Ближайшая запись: {esc(next_date)}\n"
+            f"💰 Всего: <b>{total} ₽</b>\n\n"
+            f"🗒 <b>Заметка</b>\n{esc(note) if note else '—'}")
+
+
+def client_card_kb(user_id: int) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("✏️ Изменить заметку", callback_data=f"clnote:{user_id}"))
+    kb.add(types.InlineKeyboardButton("◀️ К клиентам", callback_data="adm:clients"))
+    kb.add(types.InlineKeyboardButton("⚙️ Меню", callback_data="adm:menu"))
+    return kb
+
+
+def show_client_card(call, user_id: int) -> None:
+    client = get_client(user_id)
+    if not client:
+        safe_edit(call, "🤔 Клиент не найден.", admin_menu_kb())
+        return
+    safe_edit(call, client_card_text(client), client_card_kb(user_id))
+
+
+def clients_list_kb(rows) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup()
+    for row in rows:
+        name = (row["name"] or "").strip() or f"Клиент {row['user_id']}"
+        mark = " 📝" if (row["notes"] or "").strip() else ""
+        label = f"{name}{mark}".replace("\n", " ").replace("\r", " ")[:60]
+        kb.add(types.InlineKeyboardButton(label, callback_data=f"cl:{row['user_id']}"))
+    kb.add(types.InlineKeyboardButton("🔎 Найти по имени", callback_data="adm:clients_find"))
+    kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="adm:menu"))
+    return kb
 
 
 # ==========================================================
@@ -1286,7 +1402,9 @@ def on_callback(call):
             safe_edit(call, "🚫 Запись отменена. Можешь выбрать другое время: " + BTN_BOOK)
         elif data.startswith("cxl:"):
             do_unbook(call, int(data.split(":")[1]))
-        elif data.startswith("adm:") or data.startswith("aslot:") or data.startswith("adel:") or data.startswith("gsvc:") or data.startswith("delsvc:"):
+        elif (data.startswith("adm:") or data.startswith("aslot:") or data.startswith("adel:")
+              or data.startswith("gsvc:") or data.startswith("delsvc:")
+              or data.startswith("cl:") or data.startswith("clnote:")):
             if not is_admin(user_id):
                 safe_edit(call, "⛔️ Доступно только мастеру.")
                 return
@@ -1305,6 +1423,7 @@ def on_callback(call):
 
     except Exception as exc:
         logger.exception("Ошибка в callback '%s': %s", data, exc)
+        alert_admin_error(f"Кнопка: {data[:40]}", exc)
         safe_send(user_id, "⚠️ Что-то пошло не так. Попробуй ещё раз или напиши /start")
 
 
@@ -1477,8 +1596,18 @@ def do_book(call, slot_id: int) -> None:
             f"🗓 {fmt_date(slot['date'])} в {esc(slot['time'])}\n")
         if comment and comment != "-":
             admin_text += f"📝 Пожелание: {esc(comment)}\n"
+        try:
+            client = get_client(user_id)
+            note = (client["notes"] or "").strip() if client else ""
+        except Exception as exc:
+            logger.warning("Не удалось прочитать заметку клиента %s: %s", user_id, exc)
+            note = ""
+        if note:
+            admin_text += f"🗒 Заметка: {esc(note)}\n"
         admin_text += f"💰 {slot['price'] or 0}₽ · ⏱ {slot['duration'] or 0} мин"
-        notify_admin(admin_text)
+        note_kb = types.InlineKeyboardMarkup()
+        note_kb.add(types.InlineKeyboardButton("🗒 Заметка", callback_data=f"clnote:{user_id}"))
+        notify_admin(admin_text, note_kb)
         logger.info("Запись: slot=%s user=%s comment=%s", slot_id, user_id, comment)
     finally:
         try:
@@ -1558,6 +1687,66 @@ def handle_admin_callback(call, data: str) -> None:
                          f"{esc(row['service_name'] or 'услуга')} · {row['price'] or 0}₽")
         safe_send(call.message.chat.id, "\n".join(lines))
         safe_send(call.message.chat.id, "⚙️ Меню:", admin_menu_kb())
+
+    elif data == "adm:clients":
+        clear_state(user_id)
+        rows = q_all("""
+            SELECT c.user_id, c.name, c.username, c.notes,
+                   MAX(s.date) AS last_date
+            FROM clients c
+            LEFT JOIN slots s ON s.client_id = c.user_id AND s.is_booked = 1
+            GROUP BY c.user_id, c.name, c.username, c.notes
+            ORDER BY MAX(s.date) DESC NULLS LAST, c.name NULLS LAST, c.user_id
+            LIMIT 30
+        """)
+        total_row = q_one("SELECT COUNT(*) AS n FROM clients")
+        total = int(total_row["n"]) if total_row else 0
+        if not rows:
+            safe_edit(call, "👥 <b>Клиенты</b>\n\nПока никого нет — клиенты появятся после первой записи.",
+                      admin_menu_kb())
+            return
+        text = ("👥 <b>Клиенты</b>\n\n"
+                "Выбери клиента, чтобы открыть карточку и заметку.")
+        if total > len(rows):
+            text += (f"\n\nПоказаны {len(rows)} из {total}. "
+                     "Если нужного нет — «🔎 Найти по имени».")
+        safe_edit(call, text, clients_list_kb(rows))
+
+    elif data == "adm:clients_find":
+        set_state(user_id, "client_search")
+        safe_edit(call, "🔎 <b>Поиск клиента</b>\n\nНапиши имя или его часть:")
+
+    elif data.startswith("clnote:"):
+        try:
+            client_id = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            safe_edit(call, "🤔 Клиент не найден.", admin_menu_kb())
+            return
+        client = get_client(client_id)
+        if not client:
+            safe_edit(call, "🤔 Клиент не найден.", admin_menu_kb())
+            return
+        name = (client["name"] or "").strip() or "Клиент"
+        set_state(user_id, "client_note", client_id=client_id)
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("◀️ К карточке", callback_data=f"cl:{client_id}"))
+        prompt = safe_send(call.message.chat.id,
+                           f"🗒 <b>Заметка о клиенте</b>\n\n"
+                           f"👤 {esc(name)}\n\n"
+                           "Напиши текст заметки одним сообщением. Чтобы удалить заметку — отправь «-».\n"
+                           "Отмена — /cancel",
+                           kb)
+        if prompt:
+            _remember_screen(call.message.chat.id, prompt)
+
+    elif data.startswith("cl:"):
+        try:
+            client_id = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            safe_edit(call, "🤔 Клиент не найден.", admin_menu_kb())
+            return
+        clear_state(user_id)
+        show_client_card(call, client_id)
 
     elif data == "adm:free":
         rows = q_all("""
@@ -1810,6 +1999,58 @@ def on_text(message):
             safe_send(message.chat.id, "✅ Твой вопрос отправлен мастеру!", main_menu(user_id))
             return
 
+        if step == "client_note":
+            if not is_admin(user_id):
+                clear_state(user_id)
+                return
+            if not text:
+                send_screen(message.chat.id, "Напиши текст заметки или «-», чтобы удалить:")
+                return
+            if len(text) > 1000:
+                send_screen(message.chat.id, "Заметка слишком длинная (максимум 1000 символов). Сократи:")
+                return
+            try:
+                client_id = int(data.get("client_id", 0))
+            except (TypeError, ValueError):
+                clear_state(user_id)
+                send_screen(message.chat.id, "⚠️ Данные устарели, открой клиента заново.", admin_menu_kb())
+                return
+            set_client_note(client_id, "" if text == "-" else text)
+            clear_state(user_id)
+            client = get_client(client_id)
+            if client:
+                send_screen(message.chat.id,
+                            "✅ Заметка сохранена.\n\n" + client_card_text(client),
+                            client_card_kb(client_id))
+            else:
+                send_screen(message.chat.id, "✅ Заметка сохранена.", admin_menu_kb())
+            return
+
+        if step == "client_search":
+            if not is_admin(user_id):
+                clear_state(user_id)
+                return
+            if len(text) < 2:
+                send_screen(message.chat.id, "Введи хотя бы 2 символа имени:")
+                return
+            rows = q_all("""
+                SELECT user_id, name, username, notes
+                FROM clients
+                WHERE name ILIKE %s
+                ORDER BY name NULLS LAST, user_id
+                LIMIT 30
+            """, (f"%{text}%",))
+            clear_state(user_id)
+            if not rows:
+                kb = types.InlineKeyboardMarkup()
+                kb.add(types.InlineKeyboardButton("🔎 Искать снова", callback_data="adm:clients_find"))
+                kb.add(types.InlineKeyboardButton("👥 Все клиенты", callback_data="adm:clients"))
+                send_screen(message.chat.id, f"🔎 По запросу «{esc(text)}» никого не нашёл.", kb)
+                return
+            send_screen(message.chat.id, f"🔎 <b>Найдено: {len(rows)}</b>\nВыбери клиента:",
+                        clients_list_kb(rows))
+            return
+
         if step == "svc_name":
             if not is_admin(user_id):
                 clear_state(user_id)
@@ -1974,6 +2215,7 @@ def on_text(message):
 
     except Exception as exc:
         logger.exception("Ошибка в шаге '%s': %s", step, exc)
+        alert_admin_error(f"Шаг: {step}", exc)
         clear_state(user_id)
         safe_send(message.chat.id, "⚠️ Ошибка обработки. Начни заново: /start", main_menu(user_id))
 
@@ -2027,6 +2269,7 @@ def run_scheduler():
             schedule.run_pending()
         except Exception as exc:
             logger.exception("Планировщик: %s", exc)
+            alert_admin_error("Планировщик напоминаний", exc)
         time.sleep(1)
 
 
@@ -2060,6 +2303,7 @@ def start_web_server() -> None:
             app.run(host="0.0.0.0", port=int(port_raw), debug=False, use_reloader=False)
         except Exception as exc:
             logger.error("Веб-сервер упал: %s", exc)
+            alert_admin_error("Веб-сервер (health-check)", exc)
 
     threading.Thread(target=run, daemon=True, name="flask-health").start()
     logger.info("Health-check сервер запущен на порту %s", port_raw)
@@ -2078,6 +2322,7 @@ def main() -> None:
         logger.info("Бот @%s запущен. ADMIN_ID=%s, TZ=UTC+%s", me.username, ADMIN_ID, TZ_OFFSET)
     except Exception as exc:
         logger.error("Не удалось проверить токен (get_me): %s", exc)
+        alert_admin_error("Проверка токена (get_me)", exc)
 
     while True:
         try:
@@ -2085,6 +2330,7 @@ def main() -> None:
             bot.infinity_polling(none_stop=True, timeout=30, long_polling_timeout=30, skip_pending=True)
         except Exception as exc:
             logger.exception("Polling прервался: %s. Перезапуск через 10 сек...", exc)
+            alert_admin_error("Polling (связь с Telegram)", exc)
             time.sleep(10)
 
 
