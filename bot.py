@@ -96,17 +96,9 @@ BTN_BOOK = "📅 Записаться"
 BTN_MY = "📋 Мои записи"
 BTN_CANCEL = "❌ Отменить запись"
 BTN_ADMIN = "⚙️ Админ-панель"
-BTN_PORTFOLIO = "📁 Портфолио"
-BTN_FAQ = "💬 Вопросы и связь"
 
 WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 MAX_MSG_LEN = 3500
-
-STUDIO_NAME = (os.getenv("STUDIO_NAME") or "ALINA BEAUTY").strip() or "ALINA BEAUTY"
-STUDIO_ADDRESS = (os.getenv("STUDIO_ADDRESS") or "ул. Ленина, 15, каб. 3").strip()
-STUDIO_HOURS = (os.getenv("STUDIO_HOURS") or "ежедневно 10:00–20:00").strip()
-STUDIO_CONTACT = MASTER_CONTACT or "@Yumiii3_3"
-COVER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cover.jpg")
 
 
 # ==========================================================
@@ -315,60 +307,6 @@ def fmt_date_short(date_iso: str) -> str:
         return f"{d.strftime('%d.%m')} {WEEKDAYS[d.weekday()]}"
     except Exception:
         return str(date_iso)
-
-
-def fmt_price(value) -> str:
-    try:
-        amount = int(value or 0)
-    except (TypeError, ValueError):
-        amount = 0
-    return f"{amount:,}".replace(",", " ") + " ₽"
-
-
-def plural_ru(n, one: str, few: str, many: str) -> str:
-    try:
-        n = abs(int(n))
-    except (TypeError, ValueError):
-        n = 0
-    tail = n % 100
-    if 11 <= tail <= 14:
-        return many
-    tail %= 10
-    if tail == 1:
-        return one
-    if 2 <= tail <= 4:
-        return few
-    return many
-
-
-def btn_text(value, limit: int = 60) -> str:
-    return str(value or "").replace("\n", " ").replace("\r", " ").strip()[:limit]
-
-
-def booking_status(date_iso: str, time_hm: str) -> str:
-    try:
-        moment = datetime.strptime(f"{date_iso} {time_hm}", "%Y-%m-%d %H:%M")
-        delta = moment - now_local().replace(tzinfo=None)
-        if timedelta(0) <= delta <= timedelta(hours=24):
-            return "⏳ Скоро"
-    except (TypeError, ValueError):
-        pass
-    return "✅ Подтверждена"
-
-
-def date_button_label(date_iso: str, count: int) -> str:
-    try:
-        d = datetime.strptime(date_iso, "%Y-%m-%d")
-    except (TypeError, ValueError):
-        return f"{date_iso} · {count}"
-    tomorrow = (now_local() + timedelta(days=1)).strftime("%Y-%m-%d")
-    if date_iso == today_str():
-        prefix = "Сегодня"
-    elif date_iso == tomorrow:
-        prefix = "Завтра"
-    else:
-        prefix = f"{WEEKDAYS[d.weekday()]}, {d.strftime('%d.%m')}"
-    return f"{prefix} · {count}"
 
 
 def parse_date_input(text: str):
@@ -647,12 +585,12 @@ def clear_state(user_id: int) -> None:
 # ==========================================================
 
 def main_menu(user_id: int) -> types.ReplyKeyboardMarkup:
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(BTN_BOOK)
-    kb.row(BTN_MY, BTN_PORTFOLIO)
-    kb.row(BTN_FAQ)
+    kb.row(BTN_MY, BTN_CANCEL)
     if is_admin(user_id):
         kb.row(BTN_ADMIN)
+    kb.row("📁 Портфолио")
     return kb
 
 
@@ -660,131 +598,26 @@ def services_kb(prefix: str) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup()
     rows = q_all("SELECT id, name, duration, price FROM services ORDER BY id")
     for row in rows:
-        name = btn_text(row["name"], 40)
         kb.add(types.InlineKeyboardButton(
-            text=f"{name} · {fmt_price(row['price'])}",
+            text=f"{row['name']} - {row['price']}₽ · {row['duration']} мин",
             callback_data=f"{prefix}:{row['id']}",
         ))
     return kb
 
 
 def admin_menu_kb() -> types.InlineKeyboardMarkup:
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.row(
-        types.InlineKeyboardButton("📅 Записи", callback_data="adm:bookings"),
-        types.InlineKeyboardButton("🗓 Расписание", callback_data="adm:schedule"),
-    )
-    kb.row(
-        types.InlineKeyboardButton("🧾 Услуги", callback_data="adm:services"),
-        types.InlineKeyboardButton("👥 Клиенты", callback_data="adm:clients"),
-    )
-    kb.row(
-        types.InlineKeyboardButton("📊 Статистика", callback_data="adm:stats"),
-        types.InlineKeyboardButton("⚙️ Ещё", callback_data="adm:more"),
-    )
-    return kb
-
-
-def admin_bookings_kb() -> types.InlineKeyboardMarkup:
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.row(
-        types.InlineKeyboardButton("📆 На сегодня", callback_data="adm:today"),
-        types.InlineKeyboardButton("📚 Все записи", callback_data="adm:all"),
-    )
-    kb.row(types.InlineKeyboardButton("🕳 Свободные слоты", callback_data="adm:free"))
-    kb.row(types.InlineKeyboardButton("◀️ Назад", callback_data="adm:menu"))
-    return kb
-
-
-def admin_schedule_kb() -> types.InlineKeyboardMarkup:
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.row(
-        types.InlineKeyboardButton("➕ Добавить слот", callback_data="adm:add_slot"),
-        types.InlineKeyboardButton("📅 На неделю", callback_data="adm:gen_week"),
-    )
-    kb.row(types.InlineKeyboardButton("◀️ Назад", callback_data="adm:menu"))
-    return kb
-
-
-def admin_services_kb() -> types.InlineKeyboardMarkup:
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.row(
-        types.InlineKeyboardButton("➕ Добавить", callback_data="adm:add_service"),
-        types.InlineKeyboardButton("❌ Удалить", callback_data="adm:del_service"),
-    )
-    kb.row(types.InlineKeyboardButton("◀️ Назад", callback_data="adm:menu"))
-    return kb
-
-
-def admin_more_kb() -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("➕ Добавить слот", callback_data="adm:add_slot"))
+    kb.add(types.InlineKeyboardButton("🕳 Свободные слоты", callback_data="adm:free"))
+    kb.add(types.InlineKeyboardButton("📆 Записи на сегодня", callback_data="adm:today"))
+    kb.add(types.InlineKeyboardButton("📅 Расписание на неделю", callback_data="adm:gen_week"))
+    kb.add(types.InlineKeyboardButton("📚 Все записи", callback_data="adm:all"))
+    kb.add(types.InlineKeyboardButton("👥 Клиенты", callback_data="adm:clients"))
+    kb.add(types.InlineKeyboardButton("🧾 Добавить услугу", callback_data="adm:add_service"))
+    kb.add(types.InlineKeyboardButton("❌ Удалить услугу", callback_data="adm:del_service"))
+    kb.add(types.InlineKeyboardButton("📊 Статистика", callback_data="adm:stats"))
     kb.add(types.InlineKeyboardButton("📖 Команды", callback_data="adm:commands"))
-    kb.add(types.InlineKeyboardButton("❓ Текст FAQ", callback_data="adm:faq"))
-    kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="adm:menu"))
     return kb
-
-
-def show_services_screen(chat_id: int, user_id: int) -> None:
-    kb = services_kb("svc")
-    if not kb.keyboard:
-        safe_send(chat_id, "😔 Пока нет доступных услуг. Загляни чуть позже.", main_menu(user_id))
-        return
-    kb.row(types.InlineKeyboardButton("◀️ В меню", callback_data="back_to_main"))
-    send_screen(
-        chat_id,
-        "Шаг 1 из 4\n\n<b>Выбери услугу</b>\nПокажу свободное время и цену.",
-        kb,
-    )
-
-
-def bookings_view(user_id: int):
-    rows = my_bookings(user_id)
-    if not rows:
-        kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("📅 Записаться", callback_data="start:book"))
-        kb.add(types.InlineKeyboardButton("🏠 В меню", callback_data="back_to_main"))
-        return (
-            "📋 <b>Мои записи</b>\n\n"
-            "Пока пусто. Выбери время для себя — это займёт меньше минуты.",
-            kb,
-        )
-
-    lines = ["📋 <b>Мои записи</b>", f"Активных: <b>{len(rows)}</b>", ""]
-    kb = types.InlineKeyboardMarkup()
-    for row in rows:
-        service = esc(row["service_name"] or "услуга")
-        lines.append(f"<b>{service}</b> · {fmt_price(row['price'])}")
-        lines.append(f"📅 {fmt_date(row['date'])} · {esc(row['time'])}")
-        lines.append(booking_status(row["date"], row["time"]))
-        lines.append("")
-        label = f"🚫 Отменить · {fmt_date_short(row['date'])} {row['time']}"
-        kb.add(types.InlineKeyboardButton(btn_text(label), callback_data=f"cxl:{row['id']}"))
-    kb.add(types.InlineKeyboardButton("➕ Записаться ещё", callback_data="start:book"))
-    kb.add(types.InlineKeyboardButton("🏠 В меню", callback_data="back_to_main"))
-    return "\n".join(lines).strip(), kb
-
-
-def show_my_bookings(chat_id: int, user_id: int, call=None) -> None:
-    text, kb = bookings_view(user_id)
-    if call is not None:
-        safe_edit(call, text, kb)
-    else:
-        send_screen(chat_id, text, kb)
-
-
-def calendar_link(slot) -> str:
-    title = f"Запись: {slot['service_name'] or 'услуга'}"
-    try:
-        start_dt = datetime.strptime(f"{slot['date']} {slot['time']}", "%Y-%m-%d %H:%M")
-        duration = int(slot["duration"] or 60)
-    except (TypeError, ValueError):
-        return "https://calendar.google.com/calendar/render"
-    end_dt = start_dt + timedelta(minutes=duration)
-    dates = f"{start_dt.strftime('%Y%m%dT%H%M%S')}/{end_dt.strftime('%Y%m%dT%H%M%S')}"
-    return (
-        "https://calendar.google.com/calendar/render?action=TEMPLATE"
-        f"&text={urllib.parse.quote(title)}&dates={dates}"
-    )
 
 
 # ==========================================================
@@ -1083,45 +916,25 @@ def clients_list_kb(rows) -> types.InlineKeyboardMarkup:
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(message):
     clear_state(message.from_user.id)
-    master_line = f"👩 Мастер: <b>{esc(MASTER_NAME)}</b>\n" if MASTER_NAME else ""
     text = (
-        f"<b>{esc(STUDIO_NAME)}</b>\n"
-        "Красота в твоём ритме.\n\n"
-        "Помогу выбрать услугу и свободное время — без звонков и переписок.\n\n"
-        f"📍 {esc(STUDIO_ADDRESS)}\n"
-        f"🕰 {esc(STUDIO_HOURS)}\n"
-        f"{master_line}"
-        f"💬 {esc(STUDIO_CONTACT)}\n\n"
-        "Выбери, с чего начнём 👇"
+        f"🌸 Привет, {esc(message.from_user.first_name)}!\n\n"
+        f"Я помощник мастера <b>{esc(MASTER_NAME)}</b> 💅 \n"
+        "Помогу записаться на стрижку за 30 секунд — без звонков и переписок.\n\n"
+        "✧ <b>Что я умею:</b>\n"
+        f" {BTN_BOOK} — выбрать услугу и свободное окошко\n"
+        f" {BTN_MY} — посмотреть свои записи\n"
+        f" {BTN_CANCEL} — отменить, если планы поменялись\n\n"
+        "📍 Адрес: ул. Ленина, 15, каб. 3\n"
+        "📞 Связь: @Yumiii3_3"
     )
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.row(types.InlineKeyboardButton("📅 Записаться", callback_data="start:book"))
-    kb.row(
-        types.InlineKeyboardButton("📁 Портфолио", callback_data="start:portfolio"),
-        types.InlineKeyboardButton("💬 Вопросы", callback_data="faq_start"),
-    )
+    safe_send(message.chat.id, text, main_menu(message.from_user.id))
 
-    photo_sent = False
-    if os.path.exists(COVER_PATH):
-        try:
-            with open(COVER_PATH, "rb") as photo:
-                bot.send_photo(
-                    message.chat.id,
-                    photo,
-                    caption=text,
-                    parse_mode="HTML",
-                    reply_markup=kb,
-                )
-            photo_sent = True
-        except Exception as exc:
-            logger.warning("Не удалось отправить обложку: %s", exc)
-    if not photo_sent:
-        safe_send(message.chat.id, text, kb)
-
-    send_screen(
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("❓ Вопросы и связь", callback_data="faq_start"))
+    safe_send(
         message.chat.id,
-        "Меню всегда под рукой 👇",
-        main_menu(message.from_user.id),
+        "Если у вас есть вопросы к мастеру или вы хотите с ним связаться, нажмите «Вопросы и связь».",
+        reply_markup=kb
     )
 
 
@@ -1137,7 +950,7 @@ def cmd_admin(message):
     if not is_admin(message.from_user.id):
         safe_send(message.chat.id, "⛔️ Раздел доступен только мастеру.", main_menu(message.from_user.id))
         return
-    safe_send(message.chat.id, "⚙️ <b>Админ-панель</b>\n\nВыбери раздел.", admin_menu_kb())
+    safe_send(message.chat.id, "⚙️ <b>Админ-панель</b>\nВыбери действие:", admin_menu_kb())
 
 
 @bot.message_handler(commands=["myid"])
@@ -1196,7 +1009,7 @@ def cmd_info(message):
         "🔹 <b>/del_photo</b> — открыть портфолио для удаления фото\n"
         "🔹 <b>/broadcast</b> — сделать рассылку всем клиентам\n"
         "🔹 <b>/stats</b> — посмотреть статистику записей\n"
-        "🔹 <b>/reminders</b> — посмотреть активные напоминания\n"
+        "🔹 <b>/my_reminders</b> — посмотреть активные напоминания\n"
         "🔹 <b>/myid</b> — узнать свой Telegram ID\n"
         "🔹 <b>/admin</b> — открыть админ-панель\n"
         "🔹 <b>/info</b> — показать эту шпаргалку\n\n"
@@ -1219,19 +1032,32 @@ def on_admin_button(message):
     if not is_admin(message.from_user.id):
         safe_send(message.chat.id, "⛔️ Раздел доступен только мастеру.", main_menu(message.from_user.id))
         return
-    safe_send(message.chat.id, "⚙️ <b>Админ-панель</b>\n\nВыбери раздел.", admin_menu_kb())
+    safe_send(message.chat.id, "⚙️ <b>Админ-панель</b>\nВыбери действие:", admin_menu_kb())
 
 
 @bot.message_handler(func=lambda m: m.text == BTN_BOOK)
 def on_book(message):
     clear_state(message.from_user.id)
-    show_services_screen(message.chat.id, message.from_user.id)
+    kb = services_kb("svc")
+    if not kb.keyboard:
+        safe_send(message.chat.id, "😔 Пока нет доступных услуг.", main_menu(message.from_user.id))
+        return
+    safe_send(message.chat.id, "💅 <b>Выбери услугу:</b>", kb)
 
 
 @bot.message_handler(func=lambda m: m.text == BTN_MY)
 def on_my(message):
     clear_state(message.from_user.id)
-    show_my_bookings(message.chat.id, message.from_user.id)
+    rows = my_bookings(message.from_user.id)
+    if not rows:
+        safe_send(message.chat.id, "📭 У тебя пока нет активных записей.", main_menu(message.from_user.id))
+        return
+    lines = ["📋 <b>Твои записи:</b>", ""]
+    for row in rows:
+        lines.append(f"• <b>{esc(row['service_name'] or 'услуга')}</b>\n"
+            f"  🗓 {fmt_date(row['date'])} в {esc(row['time'])}\n"
+            f"  ⏱ {row['duration'] or 0} мин · 💰 {row['price'] or 0}₽")
+    safe_send(message.chat.id, "\n".join(lines), main_menu(message.from_user.id))
 
 
 @bot.message_handler(func=lambda m: m.text == BTN_CANCEL)
@@ -1239,24 +1065,16 @@ def on_cancel_booking(message):
     clear_state(message.from_user.id)
     rows = my_bookings(message.from_user.id)
     if not rows:
-        safe_send(
-            message.chat.id,
-            "📭 Нет записей, которые можно отменить.\n\nСамое время выбрать время для себя.",
-            main_menu(message.from_user.id),
-        )
+        safe_send(message.chat.id, "📭 Нет записей, которые можно отменить.", main_menu(message.from_user.id))
         return
     kb = types.InlineKeyboardMarkup()
     for row in rows:
-        label = f"🚫 {fmt_date_short(row['date'])} {row['time']} · {row['service_name'] or 'услуга'}"
-        kb.add(types.InlineKeyboardButton(
-            text=btn_text(label),
-            callback_data=f"cxl:{row['id']}",
-        ))
-    kb.add(types.InlineKeyboardButton("🏠 В меню", callback_data="back_to_main"))
-    send_screen(message.chat.id, "❌ <b>Какую запись отменить?</b>", kb)
+        kb.add(types.InlineKeyboardButton(text=f"🗑 {fmt_date_short(row['date'])} {row['time']} - {row['service_name'] or 'услуга'}",
+            callback_data=f"cxl:{row['id']}",))
+    safe_send(message.chat.id, "❌ <b>Какую запись отменить?</b>", kb)
 
 
-@bot.message_handler(func=lambda m: m.text == BTN_FAQ)
+@bot.message_handler(func=lambda m: m.text == "💬 Вопросы и связь")
 def faq_contact(message):
     row = q_one("SELECT value FROM config WHERE key='faq_text'")
     faq_text = row["value"] if row else "Текст FAQ не найден."
@@ -1415,19 +1233,16 @@ def cmd_dbfree_yes(message):
     safe_send(message.chat.id, f"✅ Освобождено слотов: {rowcount}. Теперь все времена свободны.")
 
 
-def send_portfolio_to(chat_id: int, user_id: int) -> None:
+@bot.message_handler(func=lambda m: m.text == "📁 Портфолио")
+def show_portfolio(message):
+    chat_id = message.chat.id
     rows = q_all("SELECT file_id, caption FROM portfolio")
     if not rows:
-        send_screen(chat_id, "📭 В портфолио пока нет фото. Совсем скоро здесь появятся работы.", main_menu(user_id))
+        safe_send(message.chat.id, "📭 У мастера пока нет фото в портфолио.", main_menu(message.from_user.id))
         return
     media_group = [types.InputMediaPhoto(media=row["file_id"]) for row in rows[:10]]
     bot.send_media_group(chat_id, media_group)
-    send_screen(chat_id, "📁 Работы мастера ✨", main_menu(user_id))
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_PORTFOLIO)
-def show_portfolio(message):
-    send_portfolio_to(message.chat.id, message.from_user.id)
+    safe_send(message.chat.id, "📁 Вот работы мастера ✨", main_menu(message.from_user.id))
 
 
 @bot.message_handler(commands=["add_photo"])
@@ -1508,18 +1323,8 @@ def on_callback(call):
     user_id = call.from_user.id
 
     try:
-        if data == "start:book":
-            clear_state(user_id)
-            show_services_screen(call.message.chat.id, user_id)
-        elif data == "start:portfolio":
-            send_portfolio_to(call.message.chat.id, user_id)
-        elif data == "my:list":
-            show_my_bookings(call.message.chat.id, user_id, call=call)
-        elif data.startswith("svc:"):
+        if data.startswith("svc:"):
             show_dates(call, int(data.split(":")[1]))
-        elif data.startswith("dts:"):
-            _, sid, offset = data.split(":", 2)
-            show_dates(call, int(sid), int(offset))
         elif data.startswith("day:"):
             _, sid, date_iso = data.split(":", 2)
             show_times(call, int(sid), date_iso)
@@ -1534,37 +1339,31 @@ def on_callback(call):
                 return
             set_state(user_id, "await_confirm", slot_id=slot_id, comment="-")
             name = get_client_name(user_id) or "Клиент"
-            safe_edit(call, confirm_text(slot, name, "-"), confirm_kb(slot_id))
+            safe_edit(call, confirm_text_with_comment(slot, name, "-"), confirm_kb(slot_id))
         elif data.startswith("conf:"):
             do_book(call, int(data.split(":")[1]))
-        elif data.startswith("chg:"):
-            slot = get_slot(int(data.split(":")[1]))
-            if not slot:
-                safe_edit(call, "😔 Запись не найдена. Начни заново: «📅 Записаться».")
-                return
-            clear_state(user_id)
-            show_times(call, slot["service_id"], slot["date"])
         elif data == "back:services":
             kb = services_kb("svc")
             if not kb.keyboard:
                 safe_edit(call, "😔 Пока нет доступных услуг.", main_menu(user_id))
                 return
-            kb.row(types.InlineKeyboardButton("◀️ В меню", callback_data="back_to_main"))
-            safe_edit(call, "Шаг 1 из 4\n\n<b>Выбери услугу</b>\nПокажу свободное время и цену.", kb)
+            safe_edit(call, "💅 <b>Выбери услугу:</b>", kb)
         elif data.startswith("cal:"):
             slot_id = int(data.split(":")[1])
             slot = get_slot(slot_id)
             if not slot:
                 safe_edit(call, "😔 Запись не найдена.")
                 return
-            calendar_url = calendar_link(slot)
+            title = f"Запись: {slot['service_name']}"
+            start_dt = f"{slot['date']}T{slot['time']}:00"
+            end_dt = (datetime.strptime(f"{slot['date']} {slot['time']}", "%Y-%m-%d %H:%M") + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:00")
+            calendar_url = f"https://calendar.google.com/calendar/render?action=TEMPLATE&text={urllib.parse.quote(title)}&dates={start_dt}/{end_dt}"
             bot.answer_callback_query(call.id, "📅 Открываю календарь...")
             kb = types.InlineKeyboardMarkup()
             kb.add(types.InlineKeyboardButton("📅 Добавить в календарь", url=calendar_url))
-            safe_send(
-                call.message.chat.id,
-                "📅 <b>Добавь запись в календарь</b>\n\nНажми на кнопку ниже.",
-                reply_markup=kb,
+            safe_send(call.message.chat.id,
+                "📅 <b>Добавь запись в календарь:</b>\n\nНажми на кнопку ниже.",
+                reply_markup=kb
             )
         elif data.startswith("delport:"):
             photo_id = int(data.split(":")[1])
@@ -1597,21 +1396,10 @@ def on_callback(call):
             safe_send(call.message.chat.id, "✍️ Если у тебя есть вопрос, напиши его прямо сейчас. Мастер ответит, как только освободится.")
         elif data == "back_to_main":
             clear_state(call.from_user.id)
-            send_screen(
-                call.message.chat.id,
-                "🏠 <b>Главное меню</b>\n\nВыбери действие 👇",
-                main_menu(call.from_user.id),
-            )
+            safe_edit(call, "🏠 Главное меню", main_menu(call.from_user.id))
         elif data == "abort":
             clear_state(user_id)
-            kb = types.InlineKeyboardMarkup()
-            kb.add(types.InlineKeyboardButton("📅 Выбрать время", callback_data="start:book"))
-            kb.add(types.InlineKeyboardButton("🏠 В меню", callback_data="back_to_main"))
-            safe_edit(
-                call,
-                "🚫 <b>Запись не подтверждена</b>\n\nВсё в порядке — можно выбрать другое время.",
-                kb,
-            )
+            safe_edit(call, "🚫 Запись отменена. Можешь выбрать другое время: " + BTN_BOOK)
         elif data.startswith("cxl:"):
             do_unbook(call, int(data.split(":")[1]))
         elif (data.startswith("adm:") or data.startswith("aslot:") or data.startswith("adel:")
@@ -1660,145 +1448,93 @@ def save_master_reply(message):
         logger.error(f"Не удалось отправить ответ клиенту: {e}")
 
 
-def confirm_text(slot, client_name: str, comment: str = "-") -> str:
-    lines = [
-        "Шаг 4 из 4",
-        "",
-        "<b>Проверь запись</b>",
-        "",
-        f"👤 {esc(client_name)}",
-        f"💅 {esc(slot['service_name'] or 'услуга')}",
-        f"📅 {fmt_date(slot['date'])} · {esc(slot['time'])}",
-        f"⏱ {slot['duration'] or 0} мин",
-        f"💰 <b>{fmt_price(slot['price'])}</b>",
-    ]
-    if comment and comment != "-":
-        lines += ["", f"📝 {esc(comment)}"]
-    lines += ["", "Всё верно?"]
-    return "\n".join(lines)
-
-
 def confirm_text_with_comment(slot, client_name: str, comment: str) -> str:
-    return confirm_text(slot, client_name, comment)
+    base = ("🧾 <b>Проверь запись:</b>\n\n"
+        f"👤 Имя: <b>{esc(client_name)}</b>\n"
+        f"💅 Услуга: <b>{esc(slot['service_name'] or 'услуга')}</b>\n"
+        f"🗓 Дата: <b>{fmt_date(slot['date'])}</b>\n"
+        f"🕒 Время: <b>{esc(slot['time'])}</b>\n"
+        f"⏱ Длительность: {slot['duration'] or 0} мин\n"
+        f"💰 Стоимость: {slot['price'] or 0}₽\n")
+    if comment and comment != "-":
+        base += f"📝 Комментарий: {esc(comment)}\n"
+    base += "\nВсё верно?"
+    return base
 
 
-def show_dates(call, service_id: int, offset: int = 0) -> None:
+def show_dates(call, service_id: int) -> None:
     service = get_service(service_id)
     if not service:
-        safe_edit(call, "😔 Услуга не найдена. Начни запись заново: «📅 Записаться».")
+        safe_edit(call, "😔 Услуга не найдена. Нажми «📅 Записаться» ещё раз.")
         return
     dates = free_dates(service_id)
     if not dates:
-        kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("◀️ К услугам", callback_data="back:services"))
-        safe_edit(call, f"😔 На услугу <b>{esc(service['name'])}</b> пока нет свободного времени.", kb)
+        safe_edit(call, f"😔 На услугу <b>{esc(service['name'])}</b> пока нет свободного времени.")
         return
-
-    try:
-        offset = int(offset)
-    except (TypeError, ValueError):
-        offset = 0
-    page_size = 6
-    max_offset = max(0, ((len(dates) - 1) // page_size) * page_size)
-    offset = min(max(0, offset), max_offset)
-    page = dates[offset:offset + page_size]
-
-    buttons = [
-        types.InlineKeyboardButton(
-            text=date_button_label(row["date"], row["cnt"]),
-            callback_data=f"day:{service_id}:{row['date']}",
-        )
-        for row in page
-    ]
     kb = types.InlineKeyboardMarkup()
-    for i in range(0, len(buttons), 2):
-        kb.row(*buttons[i:i + 2])
-
-    nav = []
-    if offset > 0:
-        nav.append(types.InlineKeyboardButton("‹ Раньше", callback_data=f"dts:{service_id}:{max(0, offset - page_size)}"))
-    if offset + page_size < len(dates):
-        nav.append(types.InlineKeyboardButton("Позже ›", callback_data=f"dts:{service_id}:{offset + page_size}"))
-    if nav:
-        kb.row(*nav)
-    kb.row(types.InlineKeyboardButton("◀️ К услугам", callback_data="back:services"))
-
-    safe_edit(
-        call,
-        (f"Шаг 2 из 4\n\n<b>{esc(service['name'])}</b> · {fmt_price(service['price'])}\n"
-         f"{service['duration']} мин\n\n"
-         "Выбери день — покажу свободное время.\n"
-         "Цифра на кнопке — число окон."),
-        kb,
-    )
+    for row in dates:
+        kb.add(types.InlineKeyboardButton(text=f"🗓 {fmt_date_short(row['date'])} · свободно: {row['cnt']}",
+            callback_data=f"day:{service_id}:{row['date']}",))
+    kb.add(types.InlineKeyboardButton("◀️ К услугам", callback_data="back:services"))
+    safe_edit(call, f"💅 Услуга: <b>{esc(service['name'])}</b> - {service['price']}₽ "
+                    f"({service['duration']} мин)\n\n🗓 <b>Выбери дату:</b>", kb)
 
 
 def show_times(call, service_id: int, date_iso: str) -> None:
     service = get_service(service_id)
     slots = free_slots_on_date(service_id, date_iso)
-    if not service:
-        safe_edit(call, "😔 Услуга не найдена. Начни запись заново: «📅 Записаться».")
+    if not service or not slots:
+        safe_edit(call, "😔 На эту дату время уже разобрали.")
         return
-    kb = types.InlineKeyboardMarkup()
-    if not slots:
-        kb.add(types.InlineKeyboardButton("◀️ К датам", callback_data=f"svc:{service_id}"))
-        safe_edit(
-            call,
-            f"😔 На {fmt_date(date_iso)} свободного времени уже нет.\n\nВыбери другой день — я рядом.",
-            kb,
-        )
-        return
+    kb = types.InlineKeyboardMarkup(row_width=3)
+    kb.add(*[types.InlineKeyboardButton(text=f"🕒 {row['time']}", callback_data=f"slot:{row['id']}")
+             for row in slots])
+    kb.add(types.InlineKeyboardButton("◀️ К датам", callback_data=f"svc:{service_id}"))
+    safe_edit(call, f"💅 <b>{esc(service['name'])}</b>\n🗓 {fmt_date(date_iso)}\n\n🕒 <b>Выбери время:</b>", kb)
 
-    time_buttons = [
-        types.InlineKeyboardButton(text=row["time"], callback_data=f"slot:{row['id']}")
-        for row in slots
-    ]
-    for i in range(0, len(time_buttons), 3):
-        kb.row(*time_buttons[i:i + 3])
-    kb.row(types.InlineKeyboardButton("◀️ К датам", callback_data=f"svc:{service_id}"))
-    safe_edit(
-        call,
-        (f"Шаг 3 из 4\n\n<b>{esc(service['name'])}</b> · {fmt_price(service['price'])}\n"
-         f"📅 {fmt_date(date_iso)}\n\n"
-         "Выбери удобное время:"),
-        kb,
-    )
+
+def confirm_text(slot, client_name: str) -> str:
+    return ("🧾 <b>Проверь запись:</b>\n\n"
+        f"👤 Имя: <b>{esc(client_name)}</b>\n"
+        f"💅 Услуга: <b>{esc(slot['service_name'] or 'услуга')}</b>\n"
+        f"🗓 Дата: <b>{fmt_date(slot['date'])}</b>\n"
+        f"🕒 Время: <b>{esc(slot['time'])}</b>\n"
+        f"⏱ Длительность: {slot['duration'] or 0} мин\n"
+        f"💰 Стоимость: {slot['price'] or 0}₽\n\n"
+        "Всё верно?")
 
 
 def confirm_kb(slot_id: int) -> types.InlineKeyboardMarkup:
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("✅ Подтвердить", callback_data=f"conf:{slot_id}"))
-    kb.row(
-        types.InlineKeyboardButton("✏️ Изменить", callback_data=f"chg:{slot_id}"),
-        types.InlineKeyboardButton("🚫 Отмена", callback_data="abort"),
-    )
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    btn_confirm = types.InlineKeyboardButton("✅ Подтвердить", callback_data=f"conf:{slot_id}")
+    btn_calendar = types.InlineKeyboardButton("📅 Добавить в календарь", callback_data=f"cal:{slot_id}")
+    btn_cancel = types.InlineKeyboardButton("🚫 Отмена", callback_data="abort")
+    kb.row(btn_confirm, btn_calendar)
+    kb.row(btn_cancel)
     return kb
 
 
 def start_confirm(call, slot_id: int) -> None:
     slot = get_slot(slot_id)
     if not slot or slot["is_booked"]:
-        safe_edit(call, "😔 Это время только что заняли. Выбери другое.")
+        safe_edit(call, "😔 Это время только что заняли.")
         return
     user_id = call.from_user.id
     name = get_client_name(user_id)
     if not name:
         set_state(user_id, "await_name", slot_id=slot_id)
-        safe_edit(
-            call,
-            "Шаг 4 из 4\n\n<b>Как тебя зовут?</b>\n"
-            "Напиши имя — сохраню его для следующих записей.",
+        safe_edit(call, "✍️ Напиши, пожалуйста, <b>своё имя</b>:")
+        return
+    if name:
+        set_state(user_id, "await_comment", slot_id=slot_id)
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("➡️ Пропустить", callback_data=f"skip:{slot_id}"))
+        safe_edit(call,
+            "✍️ Есть ли пожелания к записи?\nНапиши их сообщением или нажми <b>«➡️ Пропустить»</b>.",
+            reply_markup=kb
         )
         return
-    set_state(user_id, "await_comment", slot_id=slot_id)
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("➡️ Пропустить", callback_data=f"skip:{slot_id}"))
-    safe_edit(
-        call,
-        "Шаг 4 из 4\n\n<b>Пожелания к записи</b>\n"
-        "Напиши, что важно учесть, или пропусти этот шаг.",
-        reply_markup=kb,
-    )
+    safe_edit(call, confirm_text(slot, name), confirm_kb(slot_id))
 
 
 _confirm_locks = {}
@@ -1837,23 +1573,13 @@ def do_book(call, slot_id: int) -> None:
             safe_edit(call, "😔 Это время занял другой клиент. Выбери другое: " + BTN_BOOK)
             return
 
-        booking_code = f"AB-{int(slot_id):04d}"
-        kb_success = types.InlineKeyboardMarkup(row_width=2)
-        kb_success.row(
-            types.InlineKeyboardButton("📋 Мои записи", callback_data="my:list"),
-            types.InlineKeyboardButton("📅 В календарь", url=calendar_link(slot)),
-        )
-        kb_success.add(types.InlineKeyboardButton("🏠 В меню", callback_data="back_to_main"))
-        safe_edit(
-            call,
-            ("✅ <b>Готово! Ты записан(а)</b>\n\n"
-             f"💅 <b>{esc(slot['service_name'] or 'услуга')}</b>\n"
-             f"📅 {fmt_date(slot['date'])} · {esc(slot['time'])}\n"
-             f"💰 {fmt_price(slot['price'])}\n"
-             f"🔖 Код записи: <code>{booking_code}</code>\n\n"
-             "Ждём тебя! Если планы изменятся — открой «Мои записи»."),
-            kb_success,
-        )
+        safe_edit(call, "✅ <b>Готово! Ты записан(а) к</b> "
+                        f"{esc(MASTER_NAME)}.\n\n"
+                        f"💅 {esc(slot['service_name'] or 'услуга')}\n"
+                        f"🗓 {fmt_date(slot['date'])} в {esc(slot['time'])}\n"
+                        f"💰 {slot['price'] or 0}₽\n\n"
+                        "Если планы изменятся — нажми «❌ Отменить запись».")
+        safe_send(call.message.chat.id, "Ждём тебя! 💫", main_menu(user_id))
 
         booking_time = datetime.strptime(f"{slot['date']} {slot['time']}", "%Y-%m-%d %H:%M")
         remind_time = booking_time - timedelta(hours=1)
@@ -1878,7 +1604,7 @@ def do_book(call, slot_id: int) -> None:
             note = ""
         if note:
             admin_text += f"🗒 Заметка: {esc(note)}\n"
-        admin_text += f"💰 {fmt_price(slot['price'])} · ⏱ {slot['duration'] or 0} мин"
+        admin_text += f"💰 {slot['price'] or 0}₽ · ⏱ {slot['duration'] or 0} мин"
         note_kb = types.InlineKeyboardMarkup()
         note_kb.add(types.InlineKeyboardButton("🗒 Заметка", callback_data=f"clnote:{user_id}"))
         notify_admin(admin_text, note_kb)
@@ -1899,20 +1625,10 @@ def do_unbook(call, slot_id: int) -> None:
     if not unbook_slot(slot_id, user_id):
         safe_edit(call, "⚠️ Не удалось отменить запись.")
         return
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("📋 Мои записи", callback_data="my:list"))
-    kb.row(
-        types.InlineKeyboardButton("📅 Записаться", callback_data="start:book"),
-        types.InlineKeyboardButton("🏠 В меню", callback_data="back_to_main"),
-    )
-    safe_edit(
-        call,
-        ("✅ <b>Запись отменена</b>\n\n"
-         f"💅 {esc(slot['service_name'] or 'услуга')}\n"
-         f"📅 {fmt_date(slot['date'])} · {esc(slot['time'])}\n\n"
-         "Спасибо, что предупредили. Слот снова свободен."),
-        kb,
-    )
+    safe_edit(call, "✅ Запись отменена. Спасибо, что предупредили! 🙏\n"
+                    f"💅 {esc(slot['service_name'] or 'услуга')}\n"
+                    f"🗓 {fmt_date(slot['date'])} в {esc(slot['time'])}\n\n"
+                    "Если захотите вернуться — просто нажмите «📅 Записаться».")
     notify_admin("⚠️ <b>ОТМЕНА ЗАПИСИ</b>\n\n"
         f"👤 {esc(slot['client_name'] or call.from_user.first_name)} (id {user_id})\n"
         f"💅 {esc(slot['service_name'] or 'услуга')}\n"
@@ -1928,28 +1644,7 @@ def handle_admin_callback(call, data: str) -> None:
 
     if data == "adm:menu":
         clear_state(user_id)
-        safe_edit(call, "⚙️ <b>Админ-панель</b>\n\nВыбери раздел.", admin_menu_kb())
-
-    elif data == "adm:bookings":
-        clear_state(user_id)
-        safe_edit(call, "📅 <b>Записи</b>\n\nЧто показать?", admin_bookings_kb())
-
-    elif data == "adm:schedule":
-        clear_state(user_id)
-        safe_edit(call, "🗓 <b>Расписание</b>\n\nУправление слотами.", admin_schedule_kb())
-
-    elif data == "adm:services":
-        clear_state(user_id)
-        safe_edit(call, "🧾 <b>Услуги</b>\n\nДобавить или удалить позицию.", admin_services_kb())
-
-    elif data == "adm:more":
-        clear_state(user_id)
-        safe_edit(call, "⚙️ <b>Ещё</b>\n\nПолезные разделы.", admin_more_kb())
-
-    elif data == "adm:faq":
-        row = q_one("SELECT value FROM config WHERE key='faq_text'")
-        faq_text = row["value"] if row else "Текст FAQ не найден."
-        safe_edit(call, f"❓ <b>Текст FAQ</b>\n\n{faq_text}", admin_more_kb())
+        safe_edit(call, "⚙️ <b>Админ-панель</b>\nВыбери действие:", admin_menu_kb())
 
     elif data == "adm:add_service":
         set_state(user_id, "svc_name")
@@ -1958,40 +1653,40 @@ def handle_admin_callback(call, data: str) -> None:
     elif data == "adm:add_slot":
         kb = services_kb("aslot")
         if not kb.keyboard:
-            safe_edit(call, "Сначала добавь хотя бы одну услугу.", admin_schedule_kb())
+            safe_edit(call, "Сначала добавь хотя бы одну услугу.", admin_menu_kb())
             return
-        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="adm:schedule"))
+        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="adm:menu"))
         safe_edit(call, "➕ <b>Новый слот</b>\n\nДля какой услуги?", kb)
 
     elif data == "adm:today":
         rows = all_bookings(only_today=True)
         if not rows:
-            safe_edit(call, "📆 На сегодня записей нет. Отдыхай 😎", admin_bookings_kb())
+            safe_edit(call, "📆 На сегодня записей нет. Отдыхай 😎", admin_menu_kb())
             return
-        lines = [f"📆 <b>Записи на {fmt_date(today_str())}</b>", ""]
+        lines = [f"📆 <b>Записи на {fmt_date(today_str())}:</b>", ""]
         total = 0
         for row in rows:
             total += row["price"] or 0
             lines.append(f"🕒 <b>{esc(row['time'])}</b> — {esc(row['client_name'] or '—')} · "
-                         f"{esc(row['service_name'] or 'услуга')} · {fmt_price(row['price'])}")
-        lines.append(f"\n💰 Итого за день: <b>{fmt_price(total)}</b>")
-        safe_edit(call, "\n".join(lines), admin_bookings_kb())
+                         f"{esc(row['service_name'] or 'услуга')} · {row['price'] or 0}₽")
+        lines.append(f"\n💰 Итого за день: <b>{total}₽</b>")
+        safe_edit(call, "\n".join(lines), admin_menu_kb())
 
     elif data == "adm:all":
         rows = all_bookings()
         if not rows:
-            safe_edit(call, "📚 Активных записей нет.", admin_bookings_kb())
+            safe_edit(call, "📚 Активных записей нет.", admin_menu_kb())
             return
-        lines = ["📚 <b>Все активные записи</b>", ""]
+        lines = ["📚 <b>Все активные записи:</b>", ""]
         current_date = None
         for row in rows:
             if row["date"] != current_date:
                 current_date = row["date"]
                 lines.append(f"\n<b>🗓 {fmt_date(current_date)}</b>")
             lines.append(f"  🕒 {esc(row['time'])} — {esc(row['client_name'] or '—')} · "
-                         f"{esc(row['service_name'] or 'услуга')} · {fmt_price(row['price'])}")
+                         f"{esc(row['service_name'] or 'услуга')} · {row['price'] or 0}₽")
         safe_send(call.message.chat.id, "\n".join(lines))
-        safe_send(call.message.chat.id, "📅 <b>Записи</b>", admin_bookings_kb())
+        safe_send(call.message.chat.id, "⚙️ Меню:", admin_menu_kb())
 
     elif data == "adm:clients":
         clear_state(user_id)
@@ -2061,27 +1756,24 @@ def handle_admin_callback(call, data: str) -> None:
             ORDER BY s.date, s.time LIMIT 40
         """, (today_str(), today_str(), time_str()))
         if not rows:
-            safe_edit(call, "🕳 Свободных слотов нет — добавь новые.", admin_bookings_kb())
+            safe_edit(call, "🕳 Свободных слотов нет — добавь новые.", admin_menu_kb())
             return
         kb = types.InlineKeyboardMarkup()
         for row in rows:
-            label = f"🗑 {fmt_date_short(row['date'])} {row['time']} · {row['service_name'] or 'услуга'}"
-            kb.add(types.InlineKeyboardButton(text=btn_text(label), callback_data=f"adel:{row['id']}"))
-        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="adm:bookings"))
+            kb.add(types.InlineKeyboardButton(text=f"🗑 {fmt_date_short(row['date'])} {row['time']} — {row['service_name'] or 'услуга'}",
+                callback_data=f"adel:{row['id']}",))
+        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="adm:menu"))
         safe_edit(call, "🕳 <b>Свободные слоты</b>\nНажми, чтобы удалить слот:", kb)
 
     elif data == "adm:del_service":
         rows = q_all("SELECT id, name FROM services ORDER BY id")
         if not rows:
-            safe_edit(call, "📭 Нет услуг для удаления.", admin_services_kb())
+            safe_edit(call, "📭 Нет услуг для удаления.", admin_menu_kb())
             return
         kb = types.InlineKeyboardMarkup()
         for row in rows:
-            kb.add(types.InlineKeyboardButton(
-                text=btn_text(f"❌ {row['name']}"),
-                callback_data=f"delsvc:{row['id']}",
-            ))
-        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="adm:services"))
+            kb.add(types.InlineKeyboardButton(text=f"❌ {row['name']}", callback_data=f"delsvc:{row['id']}"))
+        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="adm:menu"))
         safe_edit(call, "❌ <b>Какую услугу удалить?</b>", kb)
 
     elif data == "adm:stats":
@@ -2150,9 +1842,9 @@ def handle_admin_callback(call, data: str) -> None:
     elif data == "adm:gen_week":
         kb = services_kb("gsvc")
         if not kb.keyboard:
-            safe_edit(call, "Сначала добавь хотя бы одну услугу.", admin_schedule_kb())
+            safe_edit(call, "Сначала добавь хотя бы одну услугу.", admin_menu_kb())
             return
-        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="adm:schedule"))
+        kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="adm:menu"))
         safe_edit(call, "📅 <b>Расписание на неделе</b>\n\nДля какой услуги?", kb)
 
     elif data == "adm:gen_go":
@@ -2224,7 +1916,7 @@ def handle_admin_callback(call, data: str) -> None:
             "❓ /edit_faq — изменить FAQ\n\n"
             "💬 /my_q — посмотреть вопросы"
         )
-        safe_edit(call, text, admin_more_kb())
+        safe_edit(call, text, admin_menu_kb())
 
     elif data.startswith("aslot:"):
         service_id = int(data.split(":")[1])
@@ -2257,7 +1949,7 @@ def on_text(message):
     try:
         if step == "await_name":
             if len(text) < 2 or len(text) > 60:
-                send_screen(message.chat.id, "✍️ Имя должно быть от 2 до 60 символов. Попробуй ещё раз:")
+                send_screen(message.chat.id, "✍️ Имя должно быть от 2 до 60 символов:")
                 return
             save_client(user_id, text, message.from_user.username or "")
             clear_state(user_id)
@@ -2268,11 +1960,9 @@ def on_text(message):
             set_state(user_id, "await_comment", slot_id=data["slot_id"])
             kb = types.InlineKeyboardMarkup()
             kb.add(types.InlineKeyboardButton("➡️ Пропустить", callback_data=f"skip:{data['slot_id']}"))
-            send_screen(
-                message.chat.id,
-                "Шаг 4 из 4\n\n<b>Пожелания к записи</b>\n"
-                "Напиши, что важно учесть, или пропусти этот шаг.",
-                reply_markup=kb,
+            send_screen(message.chat.id,
+                "✍️ Есть ли пожелания к записи?\nНапиши их сообщением или нажми <b>«➡️ Пропустить»</b>.",
+                reply_markup=kb
             )
             return
 
@@ -2289,7 +1979,7 @@ def on_text(message):
                 return
             set_state(user_id, "await_confirm", slot_id=data["slot_id"], comment=comment)
             name = get_client_name(user_id) or "Клиент"
-            send_screen(message.chat.id, confirm_text(slot, name, comment), confirm_kb(slot["id"]))
+            send_screen(message.chat.id, confirm_text_with_comment(slot, name, comment), confirm_kb(slot["id"]))
             return
 
         if step == "await_client_question":
