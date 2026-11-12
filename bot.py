@@ -602,6 +602,11 @@ def _drop_tap(message) -> None:
     _safe_delete(chat.id, getattr(message, "message_id", None))
 
 
+def _drop_question_prompt(chat_id: int) -> None:
+    """Убирает приглашение написать вопрос, если клиент ушёл в другой раздел."""
+    _delete_ids(chat_id, [_pop_id(_question_prompts, chat_id)])
+
+
 def _clear_active(chat_id: int) -> None:
     ids = []
     ids.extend(_user_inputs.pop(chat_id, []))
@@ -1312,6 +1317,7 @@ def catch_file_id(message):
 @bot.message_handler(func=lambda m: m.text == BTN_ADMIN)
 def on_admin_button(message):
     _drop_tap(message)
+    _drop_question_prompt(message.chat.id)
     clear_state(message.from_user.id)
     if not is_admin(message.from_user.id):
         safe_send(message.chat.id, "⛔️ Раздел доступен только мастеру.", main_menu(message.from_user.id))
@@ -1322,6 +1328,7 @@ def on_admin_button(message):
 @bot.message_handler(func=lambda m: m.text == BTN_BOOK)
 def on_book(message):
     _drop_tap(message)
+    _drop_question_prompt(message.chat.id)
     clear_state(message.from_user.id)
     show_services_screen(message.chat.id, message.from_user.id)
 
@@ -1329,6 +1336,7 @@ def on_book(message):
 @bot.message_handler(func=lambda m: m.text == BTN_MY)
 def on_my(message):
     _drop_tap(message)
+    _drop_question_prompt(message.chat.id)
     clear_state(message.from_user.id)
     show_my_bookings(message.chat.id, message.from_user.id)
 
@@ -1336,6 +1344,7 @@ def on_my(message):
 @bot.message_handler(func=lambda m: m.text == BTN_CANCEL)
 def on_cancel_booking(message):
     _drop_tap(message)
+    _drop_question_prompt(message.chat.id)
     clear_state(message.from_user.id)
     _clear_active(message.chat.id)
     rows = my_bookings(message.from_user.id)
@@ -1581,6 +1590,7 @@ def send_portfolio_to(chat_id: int, user_id: int) -> None:
 @bot.message_handler(func=lambda m: m.text == BTN_PORTFOLIO)
 def show_portfolio(message):
     _drop_tap(message)
+    _drop_question_prompt(message.chat.id)
     send_portfolio_to(message.chat.id, message.from_user.id)
 
 
@@ -1663,11 +1673,14 @@ def on_callback(call):
 
     try:
         if data == "start:book":
+            _drop_question_prompt(call.message.chat.id)
             clear_state(user_id)
             show_services_screen(call.message.chat.id, user_id)
         elif data == "start:portfolio":
+            _drop_question_prompt(call.message.chat.id)
             send_portfolio_to(call.message.chat.id, user_id)
         elif data == "my:list":
+            _drop_question_prompt(call.message.chat.id)
             show_my_bookings(call.message.chat.id, user_id, call=call)
         elif data.startswith("svc:"):
             show_dates(call, int(data.split(":")[1]))
@@ -2038,7 +2051,8 @@ def do_book(call, slot_id: int) -> None:
         admin_text = ("🔔 <b>НОВАЯ ЗАПИСЬ</b>\n\n"
             f"👤 {esc(name)} ({esc(username)}, id {user_id})\n"
             f"💅 {esc(slot['service_name'] or 'услуга')}\n"
-            f"🗓 {fmt_date(slot['date'])} в {esc(slot['time'])}\n")
+            f"🗓 {fmt_date(slot['date'])} в {esc(slot['time'])}\n"
+            f"🔖 Код записи: <code>{booking_code}</code>\n")
         if comment and comment != "-":
             admin_text += f"📝 Пожелание: {esc(comment)}\n"
         try:
