@@ -594,6 +594,14 @@ def _delete_user_inputs(chat_id: int) -> None:
     _delete_ids(chat_id, _user_inputs.pop(chat_id, []))
 
 
+def _drop_tap(message) -> None:
+    """Убирает нажатие кнопки нижнего меню из чата (в приватном чате — до 48 часов)."""
+    chat = getattr(message, "chat", None)
+    if chat is None or getattr(chat, "type", "private") != "private":
+        return
+    _safe_delete(chat.id, getattr(message, "message_id", None))
+
+
 def _clear_active(chat_id: int) -> None:
     ids = []
     ids.extend(_user_inputs.pop(chat_id, []))
@@ -1303,6 +1311,7 @@ def catch_file_id(message):
 
 @bot.message_handler(func=lambda m: m.text == BTN_ADMIN)
 def on_admin_button(message):
+    _drop_tap(message)
     clear_state(message.from_user.id)
     if not is_admin(message.from_user.id):
         safe_send(message.chat.id, "⛔️ Раздел доступен только мастеру.", main_menu(message.from_user.id))
@@ -1312,18 +1321,21 @@ def on_admin_button(message):
 
 @bot.message_handler(func=lambda m: m.text == BTN_BOOK)
 def on_book(message):
+    _drop_tap(message)
     clear_state(message.from_user.id)
     show_services_screen(message.chat.id, message.from_user.id)
 
 
 @bot.message_handler(func=lambda m: m.text == BTN_MY)
 def on_my(message):
+    _drop_tap(message)
     clear_state(message.from_user.id)
     show_my_bookings(message.chat.id, message.from_user.id)
 
 
 @bot.message_handler(func=lambda m: m.text == BTN_CANCEL)
 def on_cancel_booking(message):
+    _drop_tap(message)
     clear_state(message.from_user.id)
     _clear_active(message.chat.id)
     rows = my_bookings(message.from_user.id)
@@ -1347,6 +1359,7 @@ def on_cancel_booking(message):
 
 @bot.message_handler(func=lambda m: m.text == BTN_FAQ)
 def faq_contact(message):
+    _drop_tap(message)
     chat_id = message.chat.id
     user_id = message.from_user.id
     _clear_active(chat_id)
@@ -1567,6 +1580,7 @@ def send_portfolio_to(chat_id: int, user_id: int) -> None:
 
 @bot.message_handler(func=lambda m: m.text == BTN_PORTFOLIO)
 def show_portfolio(message):
+    _drop_tap(message)
     send_portfolio_to(message.chat.id, message.from_user.id)
 
 
