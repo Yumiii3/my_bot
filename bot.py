@@ -221,7 +221,8 @@ def init_db() -> None:
                         question_text TEXT NOT NULL,
                         answer_text TEXT,
                         is_answered INTEGER DEFAULT 0,
-                        created_at TEXT NOT NULL
+                        created_at TEXT NOT NULL,
+                        confirmation_message_id BIGINT
                     )
                 """)
                 cur.execute("""
@@ -260,6 +261,14 @@ def init_db() -> None:
                 except Exception as exc:
                     cur.execute("ROLLBACK TO SAVEPOINT migr_notes")
                     logger.warning("Миграция clients.notes: %s", exc)
+                cur.execute("SAVEPOINT migr_qconf")
+                try:
+                    cur.execute("ALTER TABLE questions ADD COLUMN IF NOT EXISTS confirmation_message_id BIGINT")
+                    cur.execute("RELEASE SAVEPOINT migr_qconf")
+                    logger.info("Миграция questions.confirmation_message_id: ок")
+                except Exception as exc:
+                    cur.execute("ROLLBACK TO SAVEPOINT migr_qconf")
+                    logger.warning("Миграция questions.confirmation_message_id: %s", exc)
                 cur.execute("DELETE FROM reminders WHERE is_sent = 0 AND length(remind_time) <> 16")
                 if cur.rowcount:
                     logger.info("Очищено старых напоминаний: %s", cur.rowcount)
@@ -530,6 +539,82 @@ def safe_send(chat_id: int, text: str, reply_markup=None):
 
 
 _screens = {}
+_cover_messages = {}
+_portfolio_messages = {}
+_user_inputs = {}
+_question_prompts = {}
+
+
+def _message_id(value):
+    if value is None:
+        return None
+    if hasattr(value, "message_id"):
+        value = value.message_id
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _track_id(store: dict, chat_id: int, value) -> None:
+    message_id = _message_id(value)
+    if not message_id:
+        return
+    ids = store.setdefault(chat_id, [])
+    if message_id not in ids:
+        ids.append(message_id)
+
+
+def _pop_id(store: dict, chat_id: int):
+    value = store.pop(chat_id, None)
+    return _message_id(value)
+
+
+def _safe_delete(chat_id: int, message_id) -> None:
+    message_id = _message_id(message_id)
+    if not message_id:
+        return
+    try:
+        bot.delete_message(chat_id, message_id)
+    except Exception as exc:
+        logger.debug("Не удалось удалить сообщение %s в %s: %s", message_id, chat_id, exc)
+
+
+def _delete_ids(chat_id: int, ids) -> None:
+    seen = set()
+    for value in ids:
+        message_id = _message_id(value)
+        if not message_id or message_id in seen:
+            continue
+        seen.add(message_id)
+        _safe_delete(chat_id, message_id)
+
+
+def _delete_user_inputs(chat_id: int) -> None:
+    _delete_ids(chat_id, _user_inputs.pop(chat_id, []))
+
+
+def _clear_active(chat_id: int) -> None:
+    ids = []
+    ids.extend(_user_inputs.pop(chat_id, []))
+    ids.extend(_portfolio_messages.pop(chat_id, []))
+    ids.append(_pop_id(_cover_messages, chat_id))
+    ids.append(_pop_id(_question_prompts, chat_id))
+    ids.append(_screens.pop(chat_id, None))
+    _delete_ids(chat_id, ids)
+
+
+def _cleanup_question(chat_id: int, keep_message_id, extra_user_message_id=None) -> None:
+    ids = list(_user_inputs.pop(chat_id, []))
+    if extra_user_message_id:
+        ids.append(extra_user_message_id)
+    ids.append(_pop_id(_question_prompts, chat_id))
+    old_screen = _screens.pop(chat_id, None)
+    keep = _message_id(keep_message_id)
+    if old_screen and _message_id(old_screen) != keep:
+        ids.append(old_screen)
+    _screens[chat_id] = keep
+    _delete_ids(chat_id, ids)
 
 
 def _remember_screen(chat_id: int, message) -> None:
@@ -725,6 +810,7 @@ def admin_more_kb() -> types.InlineKeyboardMarkup:
 
 
 def show_services_screen(chat_id: int, user_id: int) -> None:
+    _clear_active(chat_id)
     kb = services_kb("svc")
     if not kb.keyboard:
         safe_send(chat_id, "😔 Пока нет доступных услуг. Загляни чуть позже.", main_menu(user_id))
@@ -765,11 +851,9 @@ def bookings_view(user_id: int):
 
 
 def show_my_bookings(chat_id: int, user_id: int, call=None) -> None:
+    _clear_active(chat_id)
     text, kb = bookings_view(user_id)
-    if call is not None:
-        safe_edit(call, text, kb)
-    else:
-        send_screen(chat_id, text, kb)
+    send_screen(chat_id, text, kb)
 
 
 def calendar_link(slot) -> str:
@@ -1083,6 +1167,7 @@ def clients_list_kb(rows) -> types.InlineKeyboardMarkup:
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(message):
     clear_state(message.from_user.id)
+    _clear_active(message.chat.id)
     master_line = f"👩 Мастер: <b>{esc(MASTER_NAME)}</b>\n" if MASTER_NAME else ""
     text = (
         f"<b>{esc(STUDIO_NAME)}</b>\n"
@@ -1105,13 +1190,15 @@ def cmd_start(message):
     if os.path.exists(COVER_PATH):
         try:
             with open(COVER_PATH, "rb") as photo:
-                bot.send_photo(
+                cover_message = bot.send_photo(
                     message.chat.id,
                     photo,
                     caption=text,
                     parse_mode="HTML",
                     reply_markup=kb,
                 )
+            if cover_message:
+                _track_id(_cover_messages, message.chat.id, cover_message)
             photo_sent = True
         except Exception as exc:
             logger.warning("Не удалось отправить обложку: %s", exc)
@@ -1128,6 +1215,7 @@ def cmd_start(message):
 @bot.message_handler(commands=["cancel"])
 def cmd_cancel_state(message):
     clear_state(message.from_user.id)
+    _clear_active(message.chat.id)
     safe_send(message.chat.id, "🔄 Действие отменено. Выбери пункт меню 👇", main_menu(message.from_user.id))
 
 
@@ -1237,6 +1325,7 @@ def on_my(message):
 @bot.message_handler(func=lambda m: m.text == BTN_CANCEL)
 def on_cancel_booking(message):
     clear_state(message.from_user.id)
+    _clear_active(message.chat.id)
     rows = my_bookings(message.from_user.id)
     if not rows:
         safe_send(
@@ -1258,21 +1347,58 @@ def on_cancel_booking(message):
 
 @bot.message_handler(func=lambda m: m.text == BTN_FAQ)
 def faq_contact(message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    _clear_active(chat_id)
     row = q_one("SELECT value FROM config WHERE key='faq_text'")
     faq_text = row["value"] if row else "Текст FAQ не найден."
-    safe_send(message.chat.id, faq_text)
-    msg = bot.send_message(message.chat.id, "✍️ Если у тебя есть вопрос, напиши его прямо сейчас. Мастер ответит, как только освободится.")
-    bot.register_next_step_handler(msg, save_client_question)
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("⬅️ Вернуться", callback_data="back_to_main"))
+    send_screen(chat_id, faq_text, kb)
+    prompt = safe_send(chat_id, "✍️ Если у тебя есть вопрос, напиши его прямо сейчас. Мастер ответит, как только освободится.")
+    if prompt:
+        _track_id(_question_prompts, chat_id, prompt)
+    set_state(user_id, "await_client_question")
+
+
+def _submit_client_question(message):
+    question = (message.text or "").strip()
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    if len(question) < 3:
+        safe_send(chat_id, "❓ Вопрос слишком короткий. Напиши подробнее.")
+        return
+    row = q_one(
+        "INSERT INTO questions (user_id, question_text, created_at) "
+        "VALUES (%s, %s, %s) RETURNING id",
+        (user_id, question, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    if not row:
+        safe_send(chat_id, "⚠️ Не удалось отправить вопрос. Попробуй ещё раз.")
+        return
+    q_id = row["id"]
+    clear_state(user_id)
+    notify_admin(
+        f"📩 <b>Новый вопрос от клиента!</b>\n\n"
+        f"👤 От: {esc(message.from_user.first_name or 'Клиент')}\n"
+        f"💬 Вопрос: {esc(question)}\n\n"
+        f"Чтобы ответить, используйте команду /my_q."
+    )
+    confirmation = safe_send(
+        chat_id,
+        "✅ <b>Вопрос отправлен мастеру</b>\n\nМастер ответит здесь, как только освободится.",
+        main_menu(user_id),
+    )
+    if confirmation:
+        q_exec(
+            "UPDATE questions SET confirmation_message_id=%s WHERE id=%s",
+            (confirmation.message_id, q_id),
+        )
+        _cleanup_question(chat_id, confirmation.message_id, message.message_id)
 
 
 def save_client_question(message):
-    question = message.text.strip()
-    if len(question) < 3:
-        safe_send(message.chat.id, "❓ Вопрос слишком короткий. Напиши подробнее.")
-        return
-    q_exec("INSERT INTO questions (user_id, question_text, created_at) VALUES (%s, %s, %s)",
-           (message.from_user.id, question, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-    safe_send(message.chat.id, "✅ Твой вопрос отправлен мастеру!", reply_markup=main_menu(message.from_user.id))
+    _submit_client_question(message)
 
 
 @bot.message_handler(commands=["stats"])
@@ -1416,13 +1542,27 @@ def cmd_dbfree_yes(message):
 
 
 def send_portfolio_to(chat_id: int, user_id: int) -> None:
+    _clear_active(chat_id)
     rows = q_all("SELECT file_id, caption FROM portfolio")
     if not rows:
         send_screen(chat_id, "📭 В портфолио пока нет фото. Совсем скоро здесь появятся работы.", main_menu(user_id))
         return
     media_group = [types.InputMediaPhoto(media=row["file_id"]) for row in rows[:10]]
-    bot.send_media_group(chat_id, media_group)
-    send_screen(chat_id, "📁 Работы мастера ✨", main_menu(user_id))
+    sent = bot.send_media_group(chat_id, media_group)
+    ids = []
+    if isinstance(sent, (list, tuple)):
+        for item in sent:
+            message_id = _message_id(item)
+            if message_id:
+                ids.append(message_id)
+    elif sent:
+        message_id = _message_id(sent)
+        if message_id:
+            ids.append(message_id)
+    final = send_screen(chat_id, "📁 Работы мастера ✨", main_menu(user_id))
+    if final:
+        ids.append(_message_id(final))
+    _portfolio_messages[chat_id] = [x for x in ids if x]
 
 
 @bot.message_handler(func=lambda m: m.text == BTN_PORTFOLIO)
@@ -1588,15 +1728,21 @@ def on_callback(call):
             msg = bot.send_message(call.from_user.id, f"✍️ Напиши ответ на вопрос клиента:\n\n💬 {row['question_text']}")
             bot.register_next_step_handler(msg, save_master_reply)
         elif data == "faq_start":
+            chat_id = call.message.chat.id
+            user_id = call.from_user.id
+            _clear_active(chat_id)
             row = q_one("SELECT value FROM config WHERE key='faq_text'")
             faq_text = row["value"] if row else "Текст FAQ не найден."
             kb = types.InlineKeyboardMarkup()
             kb.add(types.InlineKeyboardButton("⬅️ Вернуться", callback_data="back_to_main"))
-            safe_edit(call, faq_text, reply_markup=kb)
-            set_state(call.from_user.id, "await_client_question")
-            safe_send(call.message.chat.id, "✍️ Если у тебя есть вопрос, напиши его прямо сейчас. Мастер ответит, как только освободится.")
+            send_screen(chat_id, faq_text, kb)
+            prompt = safe_send(chat_id, "✍️ Если у тебя есть вопрос, напиши его прямо сейчас. Мастер ответит, как только освободится.")
+            if prompt:
+                _track_id(_question_prompts, chat_id, prompt)
+            set_state(user_id, "await_client_question")
         elif data == "back_to_main":
             clear_state(call.from_user.id)
+            _clear_active(call.message.chat.id)
             send_screen(
                 call.message.chat.id,
                 "🏠 <b>Главное меню</b>\n\nВыбери действие 👇",
@@ -1604,6 +1750,7 @@ def on_callback(call):
             )
         elif data == "abort":
             clear_state(user_id)
+            _delete_user_inputs(user_id)
             kb = types.InlineKeyboardMarkup()
             kb.add(types.InlineKeyboardButton("📅 Выбрать время", callback_data="start:book"))
             kb.add(types.InlineKeyboardButton("🏠 В меню", callback_data="back_to_main"))
@@ -1653,9 +1800,18 @@ def save_master_reply(message):
     clear_state(message.from_user.id)
     safe_send(message.chat.id, "✅ Ответ сохранён! Он отправлен клиенту.")
     try:
-        q = q_one("SELECT question_text FROM questions WHERE id=%s", (q_id,))
+        q = q_one("SELECT question_text, confirmation_message_id FROM questions WHERE id=%s", (q_id,))
         if q:
-            bot.send_message(client_id, f"📬 <b>Ответ от мастера:</b>\n\n💬 Ваш вопрос: {q['question_text']}\n✍️ Ответ: {answer}")
+            sent = bot.send_message(
+                client_id,
+                f"📬 <b>Ответ от мастера:</b>\n\n💬 Ваш вопрос: {q['question_text']}\n✍️ Ответ: {answer}",
+            )
+            if sent:
+                confirmation_id = q.get("confirmation_message_id")
+                if confirmation_id:
+                    _safe_delete(client_id, confirmation_id)
+                    if _message_id(_screens.get(client_id)) == _message_id(confirmation_id):
+                        _screens.pop(client_id, None)
     except Exception as e:
         logger.error(f"Не удалось отправить ответ клиенту: {e}")
 
@@ -1854,6 +2010,7 @@ def do_book(call, slot_id: int) -> None:
              "Ждём тебя! Если планы изменятся — открой «Мои записи»."),
             kb_success,
         )
+        _delete_user_inputs(call.message.chat.id)
 
         booking_time = datetime.strptime(f"{slot['date']} {slot['time']}", "%Y-%m-%d %H:%M")
         remind_time = booking_time - timedelta(hours=1)
@@ -2254,6 +2411,9 @@ def on_text(message):
     step = state["step"]
     data = state["data"]
 
+    if step in ("await_name", "await_comment", "await_client_question"):
+        _track_id(_user_inputs, message.chat.id, message.message_id)
+
     try:
         if step == "await_name":
             if len(text) < 2 or len(text) > 60:
@@ -2293,20 +2453,7 @@ def on_text(message):
             return
 
         if step == "await_client_question":
-            question = text.strip()
-            if len(question) < 3:
-                safe_send(message.chat.id, "❓ Вопрос слишком короткий.")
-                return
-            q_exec("INSERT INTO questions (user_id, question_text, created_at) VALUES (%s, %s, %s)",
-                   (message.from_user.id, question, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-            clear_state(user_id)
-            notify_admin(
-                f"📩 <b>Новый вопрос от клиента!</b>\n\n"
-                f"👤 От: {esc(message.from_user.first_name or 'Клиент')}\n"
-                f"💬 Вопрос: {esc(question)}\n\n"
-                f"Чтобы ответить, используйте команду /my_q."
-            )
-            safe_send(message.chat.id, "✅ Твой вопрос отправлен мастеру!", main_menu(user_id))
+            _submit_client_question(message)
             return
 
         if step == "client_note":
