@@ -3,3 +3,4 @@ schedule
 pytz
 flask
 psycopg2-binary
+pillow
