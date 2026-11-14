@@ -5,6 +5,7 @@ Telegram-бот записи клиентов к частному мастеру
 TOKEN="ТВОЙ_ТОКЕН_ОТ_BOTFATHER" ADMIN_ID="ТВОЙ_TELEGRAM_ID" python main.py   (или через файл .env рядом с main.py)
 """
 
+import io
 import os
 import re
 import html
@@ -22,6 +23,15 @@ import psycopg2.extras
 
 import telebot
 from telebot import types
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_OK = True
+except Exception:
+    PIL_OK = False
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FONT_DIR = os.path.join(BASE_DIR, "fonts")
 last_portfolio_msg = {}
 
 # ==========================================================
@@ -261,6 +271,22 @@ def init_db() -> None:
                 except Exception as exc:
                     cur.execute("ROLLBACK TO SAVEPOINT migr_notes")
                     logger.warning("Миграция clients.notes: %s", exc)
+                cur.execute("SAVEPOINT migr_black")
+                try:
+                    cur.execute("ALTER TABLE clients ADD COLUMN IF NOT EXISTS is_blacklisted BOOLEAN NOT NULL DEFAULT FALSE")
+                    cur.execute("RELEASE SAVEPOINT migr_black")
+                    logger.info("Миграция clients.is_blacklisted: ок")
+                except Exception as exc:
+                    cur.execute("ROLLBACK TO SAVEPOINT migr_black")
+                    logger.warning("Миграция clients.is_blacklisted: %s", exc)
+                cur.execute("SAVEPOINT migr_rslot")
+                try:
+                    cur.execute("ALTER TABLE reminders ADD COLUMN IF NOT EXISTS slot_id BIGINT")
+                    cur.execute("RELEASE SAVEPOINT migr_rslot")
+                    logger.info("Миграция reminders.slot_id: ок")
+                except Exception as exc:
+                    cur.execute("ROLLBACK TO SAVEPOINT migr_rslot")
+                    logger.warning("Миграция reminders.slot_id: %s", exc)
                 cur.execute("SAVEPOINT migr_qconf")
                 try:
                     cur.execute("ALTER TABLE questions ADD COLUMN IF NOT EXISTS confirmation_message_id BIGINT")
@@ -539,6 +565,7 @@ def safe_send(chat_id: int, text: str, reply_markup=None):
 
 
 _screens = {}
+_photo_screens = {}
 _cover_messages = {}
 _portfolio_messages = {}
 _user_inputs = {}
@@ -614,6 +641,7 @@ def _clear_active(chat_id: int) -> None:
     ids.append(_pop_id(_cover_messages, chat_id))
     ids.append(_pop_id(_question_prompts, chat_id))
     ids.append(_screens.pop(chat_id, None))
+    _photo_screens.pop(chat_id, None)
     _delete_ids(chat_id, ids)
 
 
@@ -627,20 +655,34 @@ def _cleanup_question(chat_id: int, keep_message_id, extra_user_message_id=None)
     if old_screen and _message_id(old_screen) != keep:
         ids.append(old_screen)
     _screens[chat_id] = keep
+    _photo_screens.pop(chat_id, None)
     _delete_ids(chat_id, ids)
 
 
-def _remember_screen(chat_id: int, message) -> None:
-    if message is not None:
-        _screens[chat_id] = message.message_id
+def _remember_screen(chat_id: int, message, photo: bool = False) -> None:
+    if message is None:
+        return
+    _screens[chat_id] = message.message_id
+    if photo:
+        _photo_screens[chat_id] = message.message_id
+    else:
+        _photo_screens.pop(chat_id, None)
 
 
 def send_screen(chat_id: int, text: str, reply_markup=None):
     if isinstance(reply_markup, (types.ReplyKeyboardMarkup, types.ReplyKeyboardRemove, types.ForceReply)):
+        old_id = _message_id(_screens.get(chat_id))
         message = safe_send(chat_id, text, reply_markup)
+        if message and old_id and old_id != message.message_id:
+            _safe_delete(chat_id, old_id)
         _remember_screen(chat_id, message)
         return message
     message_id = _screens.get(chat_id)
+    if message_id and _photo_screens.get(chat_id) == message_id:
+        _safe_delete(chat_id, message_id)
+        _screens.pop(chat_id, None)
+        _photo_screens.pop(chat_id, None)
+        message_id = None
     if message_id:
         try:
             message = bot.edit_message_text(
@@ -674,9 +716,172 @@ def safe_edit(call, text: str, reply_markup=None):
         if "message is not modified" in str(exc).lower():
             return None
         logger.debug("edit_message_text не удался (%s), отправляю новое сообщение", exc)
-        message = safe_send(call.message.chat.id, text, reply_markup)
-        _remember_screen(call.message.chat.id, message)
+        chat_id = call.message.chat.id
+        old_id = getattr(call.message, "message_id", None)
+        if old_id and _photo_screens.get(chat_id) == old_id:
+            _safe_delete(chat_id, old_id)
+            _screens.pop(chat_id, None)
+            _photo_screens.pop(chat_id, None)
+        message = safe_send(chat_id, text, reply_markup)
+        _remember_screen(chat_id, message)
         return message
+
+
+# ==========================================================
+#                2.1. БАННЕРЫ ЗАПИСИ (Pillow)
+# ==========================================================
+
+BANNER_W = 900
+_BANNER_BG = "#f6eddd"
+_BANNER_CARD = "#fffdf7"
+_BANNER_BORDER = "#e0cbaa"
+_BANNER_INK = "#3b2a1e"
+_BANNER_MUTED = "#8a7460"
+_BANNER_GOLD = "#b08a52"
+_BANNER_GREEN = "#3f8f69"
+_BANNER_GREEN_BG = "#eef6f0"
+_BANNER_GREEN_BORDER = "#bcd9c6"
+_BANNER_RULE = "#ecdfc9"
+
+
+def _banner_font(name, size):
+    if not PIL_OK:
+        return None
+    for base in (FONT_DIR, "/usr/share/fonts/truetype/dejavu"):
+        path = os.path.join(base, name)
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+    return None
+
+
+def _banner_tw(draw, text, font):
+    box = draw.textbbox((0, 0), str(text), font=font)
+    return box[2] - box[0]
+
+
+def _banner_wrap(draw, text, font, max_w):
+    lines, cur = [], ""
+    for word in str(text).split():
+        probe = (cur + " " + word).strip()
+        if not cur or _banner_tw(draw, probe, font) <= max_w:
+            cur = probe
+        else:
+            lines.append(cur)
+            cur = word
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _banner_canvas(height):
+    img = Image.new("RGB", (BANNER_W, height), _BANNER_BG)
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle([40, 40, BANNER_W - 40, height - 40], radius=44,
+                           fill=_BANNER_CARD, outline=_BANNER_BORDER, width=2)
+    return img, draw
+
+
+def _banner_check(draw, cy, r=36):
+    cx = BANNER_W // 2
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=_BANNER_GREEN_BG,
+                 outline=_BANNER_GREEN_BORDER, width=2)
+    draw.line([(cx - 15, cy + 1), (cx - 4, cy + 12), (cx + 16, cy - 12)],
+              fill=_BANNER_GREEN, width=5, joint="curve")
+
+
+def _banner_center(draw, text, font, y, fill=None):
+    draw.text(((BANNER_W - _banner_tw(draw, text, font)) // 2, y),
+              str(text), font=font, fill=fill or _BANNER_INK)
+
+
+def _banner_rows(draw, y, rows, label_font, value_font, pad=64):
+    for label, value in rows:
+        draw.text((pad, y), str(label), font=label_font, fill=_BANNER_MUTED)
+        draw.text((BANNER_W - pad - _banner_tw(draw, value, value_font), y),
+                  str(value), font=value_font, fill=_BANNER_INK)
+        y += 44
+    return y
+
+
+def _banner_bytes(img):
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    buf.name = "booking.png"
+    return buf
+
+
+def render_success_banner(master, service, date_line, price, code):
+    if not PIL_OK:
+        return None
+    title_f = _banner_font("DejaVuSerif-Bold.ttf", 40)
+    sub_f = _banner_font("DejaVuSans.ttf", 26)
+    code_f = _banner_font("DejaVuSerif-Bold.ttf", 30)
+    if not (title_f and sub_f and code_f):
+        return None
+    img, draw = _banner_canvas(600)
+    _banner_check(draw, 128)
+    _banner_center(draw, "Готово! Ты записан(а)", title_f, 188)
+    _banner_center(draw, f"к {master} · {service}", sub_f, 252, _BANNER_MUTED)
+    draw.line([(90, 318), (BANNER_W - 90, 318)], fill=_BANNER_RULE, width=1)
+    _banner_center(draw, date_line, sub_f, 350)
+    _banner_center(draw, price, sub_f, 394)
+    _banner_center(draw, code, code_f, 456)
+    return _banner_bytes(img)
+
+
+def render_reminder_banner(master, when, rows, note):
+    if not PIL_OK:
+        return None
+    kick_f = _banner_font("DejaVuSans-Bold.ttf", 18)
+    title_f = _banner_font("DejaVuSerif-Bold.ttf", 32)
+    text_f = _banner_font("DejaVuSans.ttf", 24)
+    label_f = _banner_font("DejaVuSans.ttf", 24)
+    value_f = _banner_font("DejaVuSans-Bold.ttf", 24)
+    if not (kick_f and title_f and text_f and label_f and value_f):
+        return None
+
+    measure = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+    title_lines = _banner_wrap(measure, f"{when} ждём тебя у {master}", title_f, BANNER_W - 128)
+    text_lines = _banner_wrap(measure, "Если планы изменились — просто дай знать.", text_f, BANNER_W - 128)
+    note_lines = _banner_wrap(measure, note, text_f, BANNER_W - 128)
+
+    height = (84 + 26 + len(title_lines) * 42 + 8 + len(text_lines) * 34 + 16
+              + 1 + 24 + len(rows) * 44 + 14 + len(note_lines) * 34 + 62)
+    img, draw = _banner_canvas(height)
+
+    draw.text((64, 84), "НАПОМИНАНИЕ", font=kick_f, fill=_BANNER_GOLD)
+    y = 116
+    for line in title_lines:
+        draw.text((64, y), line, font=title_f, fill=_BANNER_INK)
+        y += 42
+    y += 4
+    for line in text_lines:
+        draw.text((64, y), line, font=text_f, fill=_BANNER_MUTED)
+        y += 34
+    y += 16
+    draw.line([(64, y), (BANNER_W - 64, y)], fill=_BANNER_RULE, width=1)
+    y += 24
+    y = _banner_rows(draw, y, rows, label_f, value_f)
+    y += 14
+    for line in note_lines:
+        draw.text((64, y), line, font=text_f, fill=_BANNER_MUTED)
+        y += 34
+    return _banner_bytes(img)
+
+
+def send_banner(chat_id, image, caption, reply_markup=None):
+    if not image:
+        return None
+    try:
+        return bot.send_photo(chat_id, image, caption=caption,
+                              reply_markup=reply_markup, parse_mode="HTML")
+    except Exception as exc:
+        logger.error("Не удалось отправить баннер: %s", exc)
+        return None
 
 
 def notify_admin(text: str, reply_markup=None) -> None:
@@ -1103,7 +1308,7 @@ def get_client_name(user_id: int):
 
 
 def get_client(user_id: int):
-    return q_one("SELECT user_id, name, username, notes FROM clients WHERE user_id = %s", (user_id,))
+    return q_one("SELECT user_id, name, username, notes, is_blacklisted FROM clients WHERE user_id = %s", (user_id,))
 
 
 def set_client_note(user_id: int, note: str) -> None:
@@ -1111,6 +1316,26 @@ def set_client_note(user_id: int, note: str) -> None:
         INSERT INTO clients (user_id, notes) VALUES (%s, %s)
         ON CONFLICT (user_id) DO UPDATE SET notes = excluded.notes
     """, (user_id, (note or "").strip()[:1000]))
+
+
+def set_client_blacklist(user_id: int, flag: bool) -> None:
+    q_exec("""
+        INSERT INTO clients (user_id, is_blacklisted) VALUES (%s, %s)
+        ON CONFLICT (user_id) DO UPDATE SET is_blacklisted = excluded.is_blacklisted
+    """, (user_id, bool(flag)))
+
+
+def is_client_blacklisted(user_id: int) -> bool:
+    try:
+        row = q_one("SELECT is_blacklisted FROM clients WHERE user_id = %s", (user_id,))
+    except Exception:
+        return False
+    if not row:
+        return False
+    try:
+        return bool(row["is_blacklisted"])
+    except (KeyError, IndexError, TypeError):
+        return False
 
 
 def client_stats(user_id: int):
@@ -1136,8 +1361,12 @@ def client_card_text(client) -> str:
     next_date = fmt_date(stats["next_date"]) if stats.get("next_date") else "—"
     total = stats.get("total") or 0
     note = (client.get("notes") or "").strip()
+    blocked = bool(client.get("is_blacklisted"))
+    status_line = "🚫 <b>В чёрном списке</b>\n" if blocked else ""
     return (f"👤 <b>{esc(name)}</b>\n"
-            f"{esc(username)} · id {user_id}\n\n"
+            f"{esc(username)} · id {user_id}\n"
+            f"{status_line}"
+            f"\n"
             f"📅 Записей: <b>{visits}</b>\n"
             f"🕓 Последний визит: {esc(last_date)}\n"
             f"⏭ Ближайшая запись: {esc(next_date)}\n"
@@ -1147,6 +1376,10 @@ def client_card_text(client) -> str:
 
 def client_card_kb(user_id: int) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup()
+    if is_client_blacklisted(user_id):
+        kb.add(types.InlineKeyboardButton("✅ Убрать из чёрного списка", callback_data=f"unbl:{user_id}"))
+    else:
+        kb.add(types.InlineKeyboardButton("🚫 В чёрный список", callback_data=f"bl:{user_id}"))
     kb.add(types.InlineKeyboardButton("✏️ Изменить заметку", callback_data=f"clnote:{user_id}"))
     kb.add(types.InlineKeyboardButton("◀️ К клиентам", callback_data="adm:clients"))
     kb.add(types.InlineKeyboardButton("⚙️ Меню", callback_data="adm:menu"))
@@ -1163,12 +1396,15 @@ def show_client_card(call, user_id: int) -> None:
 
 def clients_list_kb(rows) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("🔎 Найти по имени", callback_data="adm:clients_find"))
+    kb.add(types.InlineKeyboardButton("🚫 Чёрный список", callback_data="adm:blacklist"))
     for row in rows:
         name = (row["name"] or "").strip() or f"Клиент {row['user_id']}"
-        mark = " 📝" if (row["notes"] or "").strip() else ""
+        mark = " 🚫" if row.get("is_blacklisted") else ""
+        if (row["notes"] or "").strip():
+            mark += " 📝"
         label = f"{name}{mark}".replace("\n", " ").replace("\r", " ")[:60]
         kb.add(types.InlineKeyboardButton(label, callback_data=f"cl:{row['user_id']}"))
-    kb.add(types.InlineKeyboardButton("🔎 Найти по имени", callback_data="adm:clients_find"))
     kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="adm:menu"))
     return kb
 
@@ -1322,7 +1558,8 @@ def on_admin_button(message):
     if not is_admin(message.from_user.id):
         safe_send(message.chat.id, "⛔️ Раздел доступен только мастеру.", main_menu(message.from_user.id))
         return
-    safe_send(message.chat.id, "⚙️ <b>Админ-панель</b>\n\nВыбери раздел.", admin_menu_kb())
+    _clear_active(message.chat.id)
+    send_screen(message.chat.id, "⚙️ <b>Админ-панель</b>\n\nВыбери раздел.", admin_menu_kb())
 
 
 @bot.message_handler(func=lambda m: m.text == BTN_BOOK)
@@ -1330,6 +1567,13 @@ def on_book(message):
     _drop_tap(message)
     _drop_question_prompt(message.chat.id)
     clear_state(message.from_user.id)
+    if not is_admin(message.from_user.id) and is_client_blacklisted(message.from_user.id):
+        send_screen(
+            message.chat.id,
+            "🚫 <b>Онлайн-запись недоступна</b>\n\nНапиши нам — подберём время вручную.",
+            main_menu(message.from_user.id),
+        )
+        return
     show_services_screen(message.chat.id, message.from_user.id)
 
 
@@ -1675,6 +1919,13 @@ def on_callback(call):
         if data == "start:book":
             _drop_question_prompt(call.message.chat.id)
             clear_state(user_id)
+            if not is_admin(user_id) and is_client_blacklisted(user_id):
+                send_screen(
+                    call.message.chat.id,
+                    "🚫 <b>Онлайн-запись недоступна</b>\n\nНапиши нам — подберём время вручную.",
+                    main_menu(user_id),
+                )
+                return
             show_services_screen(call.message.chat.id, user_id)
         elif data == "start:portfolio":
             _drop_question_prompt(call.message.chat.id)
@@ -1823,6 +2074,7 @@ def save_master_reply(message):
     if len(answer) < 2:
         safe_send(message.chat.id, "Ответ слишком короткий.")
         return
+    _safe_delete(message.chat.id, getattr(message, "message_id", None))
     q_exec("UPDATE questions SET answer_text=%s, is_answered=1 WHERE id=%s", (answer, q_id))
     clear_state(message.from_user.id)
     safe_send(message.chat.id, "✅ Ответ сохранён! Он отправлен клиенту.")
@@ -1989,6 +2241,9 @@ _confirm_locks = {}
 
 def do_book(call, slot_id: int) -> None:
     user_id = call.from_user.id
+    if not is_admin(user_id) and is_client_blacklisted(user_id):
+        safe_edit(call, "🚫 <b>Онлайн-запись недоступна</b>\n\nНапиши нам — подберём время вручную.")
+        return
     key = (user_id, slot_id)
     lock = _confirm_locks.setdefault(key, threading.Lock())
     if not lock.acquire(blocking=False):
@@ -2027,16 +2282,40 @@ def do_book(call, slot_id: int) -> None:
             types.InlineKeyboardButton("📅 В календарь", url=calendar_link(slot)),
         )
         kb_success.add(types.InlineKeyboardButton("🏠 В меню", callback_data="back_to_main"))
-        safe_edit(
-            call,
-            ("✅ <b>Готово! Ты записан(а)</b>\n\n"
-             f"💅 <b>{esc(slot['service_name'] or 'услуга')}</b>\n"
-             f"📅 {fmt_date(slot['date'])} · {esc(slot['time'])}\n"
-             f"💰 {fmt_price(slot['price'])}\n"
-             f"🔖 Код записи: <code>{booking_code}</code>\n\n"
-             "Ждём тебя! Если планы изменятся — открой «Мои записи»."),
-            kb_success,
+        text_success = (
+            "✅ <b>Готово! Ты записан(а)</b>\n\n"
+            f"💅 <b>{esc(slot['service_name'] or 'услуга')}</b>\n"
+            f"📅 {fmt_date(slot['date'])} · {esc(slot['time'])}\n"
+            f"💰 {fmt_price(slot['price'])}\n"
+            f"🔖 Код записи: <code>{booking_code}</code>\n\n"
+            "Ждём тебя! Если планы изменятся — открой «Мои записи»."
         )
+        banner = None
+        try:
+            banner = render_success_banner(
+                MASTER_NAME or "мастер",
+                slot["service_name"] or "услуга",
+                f"{fmt_date(slot['date'])} · {slot['time']}",
+                f"{slot['service_name'] or 'услуга'} · {fmt_price(slot['price'])}",
+                booking_code,
+            )
+        except Exception as exc:
+            logger.error("Баннер записи: %s", exc)
+        sent = None
+        if banner:
+            sent = send_banner(
+                call.message.chat.id,
+                banner,
+                f"📍 {esc(STUDIO_ADDRESS)} · {esc(STUDIO_HOURS)}",
+                kb_success,
+            )
+        if sent:
+            _remember_screen(call.message.chat.id, sent, photo=True)
+            old_id = getattr(call.message, "message_id", None)
+            if old_id and old_id != sent.message_id:
+                _safe_delete(call.message.chat.id, old_id)
+        else:
+            safe_edit(call, text_success, kb_success)
         _delete_user_inputs(call.message.chat.id)
 
         booking_time = datetime.strptime(f"{slot['date']} {slot['time']}", "%Y-%m-%d %H:%M")
@@ -2044,8 +2323,8 @@ def do_book(call, slot_id: int) -> None:
         remind_time_str = remind_time.strftime("%Y-%m-%d %H:%M")
 
         if remind_time > now_local().replace(tzinfo=None):
-            q_exec("INSERT INTO reminders (user_id, text, remind_time) VALUES (%s, %s, %s)",
-                   (user_id, f"У вас запись на {esc(slot['service_name'])} к {esc(MASTER_NAME)}", remind_time_str))
+            q_exec("INSERT INTO reminders (user_id, text, remind_time, slot_id) VALUES (%s, %s, %s, %s)",
+                   (user_id, f"У вас запись на {esc(slot['service_name'])} к {esc(MASTER_NAME)}", remind_time_str, slot_id))
 
         username = f"@{call.from_user.username}" if call.from_user.username else "—"
         admin_text = ("🔔 <b>НОВАЯ ЗАПИСЬ</b>\n\n"
@@ -2181,11 +2460,11 @@ def handle_admin_callback(call, data: str) -> None:
     elif data == "adm:clients":
         clear_state(user_id)
         rows = q_all("""
-            SELECT c.user_id, c.name, c.username, c.notes,
+            SELECT c.user_id, c.name, c.username, c.notes, c.is_blacklisted,
                    MAX(s.date) AS last_date
             FROM clients c
             LEFT JOIN slots s ON s.client_id = c.user_id AND s.is_booked = 1
-            GROUP BY c.user_id, c.name, c.username, c.notes
+            GROUP BY c.user_id, c.name, c.username, c.notes, c.is_blacklisted
             ORDER BY MAX(s.date) DESC NULLS LAST, c.name NULLS LAST, c.user_id
             LIMIT 30
         """)
@@ -2205,6 +2484,56 @@ def handle_admin_callback(call, data: str) -> None:
     elif data == "adm:clients_find":
         set_state(user_id, "client_search")
         safe_edit(call, "🔎 <b>Поиск клиента</b>\n\nНапиши имя или его часть:")
+
+    elif data == "adm:blacklist":
+        clear_state(user_id)
+        rows = q_all("""
+            SELECT user_id, name, username
+            FROM clients
+            WHERE is_blacklisted = TRUE
+            ORDER BY name NULLS LAST, user_id
+            LIMIT 50
+        """)
+        kb = types.InlineKeyboardMarkup()
+        for row in rows:
+            name = (row["name"] or "").strip() or f"Клиент {row['user_id']}"
+            kb.add(types.InlineKeyboardButton(f"✅ {name}"[:60], callback_data=f"unbl:{row['user_id']}"))
+        kb.add(types.InlineKeyboardButton("🔎 Найти по имени", callback_data="adm:clients_find"))
+        kb.add(types.InlineKeyboardButton("◀️ К клиентам", callback_data="adm:clients"))
+        if rows:
+            text = ("🚫 <b>Чёрный список</b>\n\n"
+                    f"Заблокировано: <b>{len(rows)}</b>\n\n"
+                    "Нажми на имя, чтобы открыть карточку и разблокировать.")
+        else:
+            text = ("🚫 <b>Чёрный список</b>\n\n"
+                    "Пока пусто. Открой карточку клиента и нажми «🚫 В чёрный список».")
+        safe_edit(call, text, kb)
+
+    elif data.startswith("bl:"):
+        try:
+            client_id = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            safe_edit(call, "🤔 Клиент не найден.", admin_menu_kb())
+            return
+        if not get_client(client_id):
+            safe_edit(call, "🤔 Клиент не найден.", admin_menu_kb())
+            return
+        set_client_blacklist(client_id, True)
+        clear_state(user_id)
+        show_client_card(call, client_id)
+
+    elif data.startswith("unbl:"):
+        try:
+            client_id = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            safe_edit(call, "🤔 Клиент не найден.", admin_menu_kb())
+            return
+        if not get_client(client_id):
+            safe_edit(call, "🤔 Клиент не найден.", admin_menu_kb())
+            return
+        set_client_blacklist(client_id, False)
+        clear_state(user_id)
+        show_client_card(call, client_id)
 
     elif data.startswith("clnote:"):
         try:
@@ -2501,6 +2830,7 @@ def on_text(message):
                 send_screen(message.chat.id, "⚠️ Данные устарели, открой клиента заново.", admin_menu_kb())
                 return
             set_client_note(client_id, "" if text == "-" else text)
+            _safe_delete(message.chat.id, getattr(message, "message_id", None))
             clear_state(user_id)
             client = get_client(client_id)
             if client:
@@ -2519,12 +2849,13 @@ def on_text(message):
                 send_screen(message.chat.id, "Введи хотя бы 2 символа имени:")
                 return
             rows = q_all("""
-                SELECT user_id, name, username, notes
+                SELECT user_id, name, username, notes, is_blacklisted
                 FROM clients
                 WHERE name ILIKE %s
                 ORDER BY name NULLS LAST, user_id
                 LIMIT 30
             """, (f"%{text}%",))
+            _safe_delete(message.chat.id, getattr(message, "message_id", None))
             clear_state(user_id)
             if not rows:
                 kb = types.InlineKeyboardMarkup()
@@ -2544,6 +2875,7 @@ def on_text(message):
                 send_screen(message.chat.id, "Название должно быть 2–80 символов:")
                 return
             set_state(user_id, "svc_duration", name=text)
+            _delete_user_inputs(message.chat.id)
             send_screen(message.chat.id, "Шаг 2/3. Длительность в минутах:")
             return
 
@@ -2555,6 +2887,7 @@ def on_text(message):
                 send_screen(message.chat.id, "Нужно число от 5 до 600:")
                 return
             set_state(user_id, "svc_price", name=data["name"], duration=int(text))
+            _delete_user_inputs(message.chat.id)
             send_screen(message.chat.id, "Шаг 3/3. Цена в рублях:")
             return
 
@@ -2570,10 +2903,15 @@ def on_text(message):
             q_exec("INSERT INTO services (name, duration, price) VALUES (%s,%s,%s)",
                    (data["name"], data["duration"], price))
             clear_state(user_id)
-            safe_send(message.chat.id,
-                      f"✅ Услуга добавлена:\n💅 <b>{esc(data['name'])}</b>\n"
-                      f"⏱ {data['duration']} мин · 💰 {price}₽")
-            safe_send(message.chat.id, "⚙️ Меню:", admin_menu_kb())
+            _delete_user_inputs(message.chat.id)
+            send_screen(
+                message.chat.id,
+                f"✅ <b>Услуга добавлена</b>\n\n"
+                f"💅 {esc(data['name'])}\n"
+                f"⏱ {data['duration']} мин · 💰 {price} ₽\n\n"
+                "⚙️ Выбери раздел:",
+                admin_menu_kb(),
+            )
             return
 
         if step == "slot_date":
@@ -2616,6 +2954,7 @@ def on_text(message):
                 else:
                     skipped.append(t)
             clear_state(user_id)
+            _delete_user_inputs(message.chat.id)
             service = get_service(service_id)
             report = [f"💅 <b>{esc(service['name'] if service else 'услуга')}</b>\n🗓 {fmt_date(date_iso)}"]
             if added:
@@ -2624,8 +2963,7 @@ def on_text(message):
                 report.append("⏭ Пропущено: " + ", ".join(skipped))
             if bad:
                 report.append("⚠️ Не распознано: " + ", ".join(bad))
-            safe_send(message.chat.id, "\n".join(report))
-            safe_send(message.chat.id, "⚙️ Меню:", admin_menu_kb())
+            send_screen(message.chat.id, "\n".join(report) + "\n\n⚙️ Выбери раздел:", admin_menu_kb())
             return
 
         if step == "gen_hours":
@@ -2637,6 +2975,7 @@ def on_text(message):
                 send_screen(message.chat.id, "❗️ Формат: <code>10:00-19:00</code>")
                 return
             set_state(user_id, "gen_step", service_id=data["service_id"], start=rng[0], end=rng[1])
+            _delete_user_inputs(message.chat.id)
             send_screen(message.chat.id,
                       f"🕒 Часы: <b>{rng[0]}–{rng[1]}</b>\n\n"
                       "Шаг 2/3. Перерыв между записями, мин:\n<code>0</code> · <code>10</code> · <code>15</code> · <code>20</code>")
@@ -2651,6 +2990,7 @@ def on_text(message):
                 return
             set_state(user_id, "gen_days", service_id=data["service_id"],
                       start=data["start"], end=data["end"], break_min=int(text))
+            _delete_user_inputs(message.chat.id)
             send_screen(message.chat.id,
                       "Шаг 3/3. На сколько дней вперёд? (1–60)\n\n"
                       "Добавь <b>будни</b>, чтобы пропустить Сб и Вс:\n"
@@ -2719,7 +3059,7 @@ def check_reminders():
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT id, user_id, text, remind_time
+                SELECT id, user_id, text, remind_time, slot_id
                 FROM reminders
                 WHERE is_sent = 0 AND remind_time <= %s
                 ORDER BY remind_time
@@ -2738,9 +3078,30 @@ def check_reminders():
                     cur.execute("UPDATE reminders SET is_sent=1 WHERE id=%s", (r_id,))
                     continue
                 try:
-                    bot.send_message(user_id,
-                        f"⏰ <b>Напоминание:</b> {text}{contact}",
-                        parse_mode='HTML')
+                    sent = False
+                    slot_id = row.get("slot_id")
+                    slot = get_slot(slot_id) if slot_id else None
+                    if slot:
+                        image = render_reminder_banner(
+                            MASTER_NAME or "мастер",
+                            f"Сегодня в {slot['time']}",
+                            [("Услуга", f"{slot['service_name'] or 'услуга'} · {slot['duration'] or 0} мин"),
+                             ("Адрес", STUDIO_ADDRESS),
+                             ("Код", f"AB-{int(slot_id):04d}")],
+                            "Отменить запись можно в «Моих записях».",
+                        )
+                        if image:
+                            kb = types.InlineKeyboardMarkup()
+                            kb.add(types.InlineKeyboardButton("📋 Мои записи", callback_data="my:list"))
+                            sent = bot.send_photo(
+                                user_id, image,
+                                caption="⏰ Напоминание о записи",
+                                reply_markup=kb,
+                            ) is not None
+                    if not sent:
+                        bot.send_message(user_id,
+                            f"⏰ <b>Напоминание:</b> {text}{contact}",
+                            parse_mode='HTML')
                 except Exception as e:
                     print(f"Ошибка отправки: {e}")
                 cur.execute("UPDATE reminders SET is_sent=1 WHERE id=%s", (r_id,))
