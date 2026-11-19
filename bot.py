@@ -112,10 +112,10 @@ BTN_FAQ = "💬 Вопросы и связь"
 WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 MAX_MSG_LEN = 3500
 
-STUDIO_NAME = (os.getenv("STUDIO_NAME") or "SHARLI").strip() or "SHARLI"
+STUDIO_NAME = (os.getenv("STUDIO_NAME") or "Beauty Studio").strip() or "Beauty Studio"
 STUDIO_ADDRESS = (os.getenv("STUDIO_ADDRESS") or "Махачкала, просп. Имама Шамиля, 93").strip()
 STUDIO_HOURS = (os.getenv("STUDIO_HOURS") or "ежедневно 9:00–19:00").strip()
-STUDIO_CONTACT = (os.getenv("STUDIO_CONTACT") or "@sharli_beauty").strip()
+STUDIO_CONTACT = (os.getenv("STUDIO_CONTACT") or "").strip()
 COVER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cover.jpg")
 
 
@@ -629,6 +629,14 @@ def _drop_tap(message) -> None:
     _safe_delete(chat.id, getattr(message, "message_id", None))
 
 
+def _drop_input(message) -> None:
+    """Убирает ввод клиента или мастера из чата (только приватный чат)."""
+    chat = getattr(message, "chat", None)
+    if chat is None or getattr(chat, "type", "private") != "private":
+        return
+    _safe_delete(chat.id, getattr(message, "message_id", None))
+
+
 def _drop_question_prompt(chat_id: int) -> None:
     """Убирает приглашение написать вопрос, если клиент ушёл в другой раздел."""
     _delete_ids(chat_id, [_pop_id(_question_prompts, chat_id)])
@@ -814,17 +822,37 @@ def _banner_bytes(img):
     return buf
 
 
-def render_success_banner(master, service, date_line, price, code):
+def render_success_banner(master, service, date_line, price, code, name=""):
     if not PIL_OK:
         return None
-    title_f = _banner_font("DejaVuSerif-Bold.ttf", 40)
     sub_f = _banner_font("DejaVuSans.ttf", 26)
     code_f = _banner_font("DejaVuSerif-Bold.ttf", 30)
-    if not (title_f and sub_f and code_f):
+    if not (sub_f and code_f):
         return None
+
+    name_clean = " ".join((name or "").split())
+    if len(name_clean) > 24:
+        cut = name_clean[:23]
+        if " " in cut:
+            cut = cut[:cut.rfind(" ")]
+        name_clean = cut.rstrip() + "…"
+    title = f"{name_clean}, всё готово!" if name_clean else "Готово! Ты записан(а)"
+
+    measure = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+    title_f = None
+    for size in (40, 36, 32, 28, 26):
+        font = _banner_font("DejaVuSerif-Bold.ttf", size)
+        if font and _banner_tw(measure, title, font) <= BANNER_W - 150:
+            title_f = font
+            break
+    if not title_f:
+        title_f = _banner_font("DejaVuSerif-Bold.ttf", 26)
+    if not title_f:
+        return None
+
     img, draw = _banner_canvas(600)
     _banner_check(draw, 128)
-    _banner_center(draw, "Готово! Ты записан(а)", title_f, 188)
+    _banner_center(draw, title, title_f, 188)
     _banner_center(draw, f"к {master} · {service}", sub_f, 252, _BANNER_MUTED)
     draw.line([(90, 318), (BANNER_W - 90, 318)], fill=_BANNER_RULE, width=1)
     _banner_center(draw, date_line, sub_f, 350)
@@ -1415,9 +1443,11 @@ def clients_list_kb(rows) -> types.InlineKeyboardMarkup:
 
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(message):
+    _drop_input(message)
     clear_state(message.from_user.id)
     _clear_active(message.chat.id)
     master_line = f"👩 Мастер: <b>{esc(MASTER_NAME)}</b>\n" if MASTER_NAME else ""
+    contact_line = f"💬 {esc(STUDIO_CONTACT)}\n" if STUDIO_CONTACT else ""
     text = (
         f"<b>{esc(STUDIO_NAME)}</b>\n"
         "Красота в каждой детали.\n\n"
@@ -1425,7 +1455,7 @@ def cmd_start(message):
         f"📍 {esc(STUDIO_ADDRESS)}\n"
         f"🕰 {esc(STUDIO_HOURS)}\n"
         f"{master_line}"
-        f"💬 {esc(STUDIO_CONTACT)}\n\n"
+        f"{contact_line}\n"
         "Выбери, с чего начнём 👇"
     )
     kb = types.InlineKeyboardMarkup(row_width=2)
@@ -1463,6 +1493,7 @@ def cmd_start(message):
 
 @bot.message_handler(commands=["cancel"])
 def cmd_cancel_state(message):
+    _drop_input(message)
     clear_state(message.from_user.id)
     _clear_active(message.chat.id)
     safe_send(message.chat.id, "🔄 Действие отменено. Выбери пункт меню 👇", main_menu(message.from_user.id))
@@ -1470,6 +1501,7 @@ def cmd_cancel_state(message):
 
 @bot.message_handler(commands=["admin"])
 def cmd_admin(message):
+    _drop_input(message)
     clear_state(message.from_user.id)
     if not is_admin(message.from_user.id):
         safe_send(message.chat.id, "⛔️ Раздел доступен только мастеру.", main_menu(message.from_user.id))
@@ -1479,11 +1511,13 @@ def cmd_admin(message):
 
 @bot.message_handler(commands=["myid"])
 def cmd_myid(message):
+    _drop_input(message)
     safe_send(message.chat.id, f"🆔 Твой Telegram ID: <code>{message.from_user.id}</code>")
 
 
 @bot.message_handler(commands=["edit_faq"])
 def cmd_edit_faq(message):
+    _drop_input(message)
     if not is_admin(message.from_user.id):
         return
     row = q_one("SELECT value FROM config WHERE key='faq_text'")
@@ -1498,11 +1532,13 @@ def save_new_faq(message):
         safe_send(message.chat.id, "Текст слишком короткий. Попробуй ещё раз через /edit_faq.")
         return
     q_exec("UPDATE config SET value=%s WHERE key='faq_text'", (new_text,))
+    _drop_input(message)
     safe_send(message.chat.id, "✅ Текст FAQ обновлён!")
 
 
 @bot.message_handler(commands=["my_q"])
 def cmd_my_questions(message):
+    _drop_input(message)
     if not is_admin(message.from_user.id):
         return
     rows = q_all("SELECT id, user_id, question_text, created_at FROM questions WHERE is_answered=0 ORDER BY created_at ASC")
@@ -1523,6 +1559,7 @@ def cmd_my_questions(message):
 
 @bot.message_handler(commands=["info"])
 def cmd_info(message):
+    _drop_input(message)
     if not is_admin(message.from_user.id):
         safe_send(message.chat.id, "⛔️ Эта команда только для мастера.")
         return
@@ -1669,6 +1706,7 @@ def save_client_question(message):
 
 @bot.message_handler(commands=["stats"])
 def cmd_stats(message):
+    _drop_input(message)
     if not is_admin(message.from_user.id):
         safe_send(message.chat.id, "⛔️ Статистика доступна только мастеру.")
         return
@@ -1729,6 +1767,7 @@ def cmd_stats(message):
 
 @bot.message_handler(commands=["reminders"])
 def cmd_reminders(message):
+    _drop_input(message)
     if not is_admin(message.from_user.id):
         safe_send(message.chat.id, "⛔️ Доступно только мастеру.")
         return
@@ -1750,6 +1789,7 @@ def cmd_reminders(message):
 
 @bot.message_handler(commands=["broadcast"])
 def cmd_broadcast(message):
+    _drop_input(message)
     if not is_admin(message.from_user.id):
         safe_send(message.chat.id, "⛔️ Рассылку может делать только мастер.")
         return
@@ -1777,6 +1817,7 @@ def cmd_broadcast(message):
 
 @bot.message_handler(commands=["dbfree"])
 def cmd_dbfree(message):
+    _drop_input(message)
     if not is_admin(message.from_user.id):
         safe_send(message.chat.id, "⛔️ Доступно только мастеру.")
         return
@@ -1800,6 +1841,7 @@ def cmd_dbfree(message):
 
 @bot.message_handler(commands=["dbfree_yes"])
 def cmd_dbfree_yes(message):
+    _drop_input(message)
     if not is_admin(message.from_user.id):
         safe_send(message.chat.id, "⛔️ Доступно только мастеру.")
         return
@@ -1840,6 +1882,7 @@ def show_portfolio(message):
 
 @bot.message_handler(commands=["add_photo"])
 def cmd_add_photo(message):
+    _drop_input(message)
     if not is_admin(message.from_user.id):
         safe_send(message.chat.id, "⛔️ Добавлять фото может только мастер.")
         return
@@ -1849,6 +1892,7 @@ def cmd_add_photo(message):
 
 @bot.message_handler(commands=["del_photo"])
 def cmd_del_photo(message):
+    _drop_input(message)
     if not is_admin(message.from_user.id):
         safe_send(message.chat.id, "🌷 Фото удалено.")
         return
@@ -2298,6 +2342,7 @@ def do_book(call, slot_id: int) -> None:
                 f"{fmt_date(slot['date'])} · {slot['time']}",
                 f"{slot['service_name'] or 'услуга'} · {fmt_price(slot['price'])}",
                 booking_code,
+                name=name,
             )
         except Exception as exc:
             logger.error("Баннер записи: %s", exc)
@@ -2768,8 +2813,12 @@ def on_text(message):
     step = state["step"]
     data = state["data"]
 
-    if step in ("await_name", "await_comment", "await_client_question"):
-        _track_id(_user_inputs, message.chat.id, message.message_id)
+    if step in ("await_name", "await_comment", "await_client_question", "reply_to_q",
+                "client_note", "client_search",
+                "svc_name", "svc_duration", "svc_price",
+                "slot_date", "slot_time",
+                "gen_hours", "gen_step", "gen_days"):
+        _drop_input(message)
 
     try:
         if step == "await_name":
